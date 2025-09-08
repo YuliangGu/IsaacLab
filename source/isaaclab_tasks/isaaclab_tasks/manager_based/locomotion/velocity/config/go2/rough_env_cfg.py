@@ -22,16 +22,22 @@ class UnitreeGo2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.scene.robot = UNITREE_GO2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
         self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/base"
         # scale down the terrains because the robot is small
-        self.scene.terrain.terrain_generator.sub_terrains["boxes"].grid_height_range = (0.025, 0.1)
-        self.scene.terrain.terrain_generator.sub_terrains["random_rough"].noise_range = (0.01, 0.06)
-        self.scene.terrain.terrain_generator.sub_terrains["random_rough"].noise_step = 0.01
+        # self.scene.terrain.terrain_generator.sub_terrains["boxes"].grid_height_range = (0.025, 0.1)
+        # self.scene.terrain.terrain_generator.sub_terrains["random_rough"].noise_range = (0.01, 0.06)
+        # self.scene.terrain.terrain_generator.sub_terrains["random_rough"].noise_step = 0.01
+
+        # NOTE: increase the DR scale for better generalization
+        self.scene.terrain.terrain_generator.sub_terrains["boxes"].grid_height_range = (0.05, 0.2)
+        self.scene.terrain.terrain_generator.sub_terrains["random_rough"].noise_range = (0.02, 0.08)
+        self.scene.terrain.terrain_generator.sub_terrains["random_rough"].noise_step = 0.05
 
         # reduce action scale
         self.actions.joint_pos.scale = 0.25
 
         # event
         self.events.push_robot = None
-        self.events.add_base_mass.params["mass_distribution_params"] = (-1.0, 3.0)
+        # self.events.add_base_mass.params["mass_distribution_params"] = (-1.0, 3.0)
+        self.events.add_base_mass.params["mass_distribution_params"] = (-2.0, 4.0)
         self.events.add_base_mass.params["asset_cfg"].body_names = "base"
         self.events.base_external_force_torque.params["asset_cfg"].body_names = "base"
         self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
