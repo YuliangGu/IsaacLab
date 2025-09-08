@@ -34,33 +34,12 @@ Requires:
 
 Use the training script under `scripts/reinforcement_learning/rsl_rl/train_byol.py`.
 
-- Enable BYOL (default on):
+- To run (BYOL default on):
 
 ```
-isaaclab.bat -p scripts/reinforcement_learning/rsl_rl/train_byol.py \
-  --task=Isaac-Ant-v0 --num_envs=50 --headless
+isaaclab.bat -p scripts\reinforcement_learning\rsl_rl\train_byol.py --task  Isaac-Velocity-Rough-Unitree-Go2-v0 --num_envs=1000 --headless
 ```
 
-- Explicitly use our BYOL agent config alias:
-
-```
-isaaclab.bat -p scripts/reinforcement_learning/rsl_rl/train_byol.py \
-  --agent=myrl_byol --task=Isaac-Ant-v0 --num_envs=50 --headless
-```
-
-- Disable BYOL (run pure PPO through the same pipeline):
-
-```
-isaaclab.bat -p scripts/reinforcement_learning/rsl_rl/train_byol.py \
-  --no-byol --task=Isaac-Ant-v0 --num_envs=50 --headless
-```
-
-- Print effective BYOL/policy knobs:
-
-```
-isaaclab.bat -p scripts/reinforcement_learning/rsl_rl/train_byol.py \
-  --byol_debug --task=Isaac-Ant-v0 --num_envs=50 --headless
-```
 
 ### Key algorithm knobs (agent.algorithm)
 

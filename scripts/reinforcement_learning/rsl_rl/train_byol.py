@@ -31,10 +31,10 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
-# Convenience toggle: use BYOL by default without changing registry entry
 parser.add_argument("--no-byol", dest="use_byol", action="store_false", help="Disable BYOL defaults.")
 parser.set_defaults(use_byol=True)
 parser.add_argument("--byol_debug", action="store_true", default=False, help="Print effective BYOL/policy knobs.")
+parser.set_defaults(byol_debug=True)
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
@@ -123,14 +123,16 @@ torch.backends.cudnn.benchmark = False
         * then inside main() we replace agent_cfg with PPObyolRunnerCfg().
 """
 
-_hydra_agent_entry = args_cli.agent if args_cli.agent != "myrl_byol" else "rsl_rl_cfg_entry_point"
+def _overlay(cfg_1, cfg_2):
+    """overlay cfg_2 on top of cfg_1"""
+    d1 = cfg_1.to_dict()
+    d2 = cfg_2.to_dict()
+    d1.update(d2)
+    return type(cfg_1)(**d1)
 
-@hydra_task_config(args_cli.task, _hydra_agent_entry)
+@hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Train with RSL-RL agent."""
-    # myrl_byol alias: keep Hydra-provided agent_cfg, but signal BYOL defaults below
-    if args_cli.agent == "myrl_byol":
-        print("[INFO] Using myrl_byol alias (keeping base agent cfg; enabling BYOL defaults)")
 
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
@@ -200,30 +202,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-    # If BYOL defaults enabled, switch policy/algorithm classes accordingly
     if args_cli.use_byol:
-        try:
-            agent_cfg.algorithm.class_name = "PPOWithBYOL"
-            agent_cfg.policy.class_name = "ActorCriticAug"
-            if getattr(agent_cfg.policy, "ctx_mode", None) is None:
-                agent_cfg.policy.ctx_mode = "film"
-            if getattr(agent_cfg.policy, "ctx_dim", 0) == 0:
-                agent_cfg.policy.ctx_dim = 64
-            # ensure byol_z_dim is set and matches ctx_dim
-            ctx_dim_val = int(getattr(agent_cfg.policy, "ctx_dim", 64))
-            byol_z_dim_val = getattr(agent_cfg.algorithm, "byol_z_dim", None)
-            if byol_z_dim_val is None or int(byol_z_dim_val) == 0:
-                agent_cfg.algorithm.byol_z_dim = ctx_dim_val
-            elif int(byol_z_dim_val) != ctx_dim_val:
-                raise ValueError("For BYOL, byol_z_dim must match policy.ctx_dim.")
-            if args_cli.byol_debug:
-                print("[INFO] Using BYOL-based agent configuration defaults.")
-                print_dict(agent_cfg.to_dict(), nesting=4)
-        except Exception:
-            raise ValueError("BYOL defaults requested but agent_cfg does not have the required structure.")
-
+        print("[OVERRIDE] Using BYOL defaults on top of existing agent config.")
+        agent_cfg.policy = _overlay(PPObyolRunnerCfg.policy(), agent_cfg.policy)
+        agent_cfg.algorithm = _overlay(PPObyolRunnerCfg.algorithm(), agent_cfg.algorithm)
+        agent_cfg.class_name = "OnPolicyRunnerBYOL"
+        agent_cfg.policy.class_name = "ActorCriticAug"
+        agent_cfg.algorithm.class_name = "PPOWithBYOL"
+        if args_cli.byol_debug:
+            print("[BYOL DEBUG] Effective agent config after BYOL overlay:")
+            print_dict(agent_cfg.to_dict(), nesting=4)
+            
     # create runner (use BYOL runner if BYOL algorithm is requested)
-    if agent_cfg.class_name == "OnPolicyRunnerBYOL" or agent_cfg.algorithm.class_name == "PPOWithBYOL":
+    if agent_cfg.class_name == "OnPolicyRunnerBYOL":
         runner = OnPolicyRunnerBYOL(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "OnPolicyRunner":
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)

@@ -261,7 +261,12 @@ class ActorCriticAug(ActorCritic):
         head_in = feat_dim + (ctx_dim if (self.ctx_mode == "concat" and ctx_dim > 0) else 0)
 
         def fmt_dim(x):
-            return "?" if x is None else str(int(x))
+            if x is None:
+                return "?"
+            try:
+                return str(int(x))
+            except Exception:
+                return str(x)
 
         lines: list[str] = []
 
