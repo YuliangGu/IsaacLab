@@ -53,3 +53,21 @@ def terrain_levels_vel(
     terrain.update_env_origins(env_ids, move_up, move_down)
     # return the mean terrain level
     return torch.mean(terrain.terrain_levels.float())
+
+
+def terrain_levels_vel_dist(
+    env: ManagerBasedRLEnv, env_ids: Sequence[int], asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """ A stochastic curriculum sampler based on two criteria:
+        ** learnability **: the distance the robot walked when commanded to move at a desired velocity.
+        ** uncertainty [optional] **: BYOL prediction error (intrinsic uncertainty by representation learning).
+    """
+
+    # extract the used quantities (to enable type-hinting)
+    asset: Articulation = env.scene[asset_cfg.name]
+    terrain: TerrainImporter = env.scene.terrain
+    command = env.command_manager.get_command("base_velocity")
+
+    # get terrain levels
+    terrain_levels = terrain.terrain_levels[env_ids]
+    raise NotImplementedError("Uncertainty criterion not implemented yet.")

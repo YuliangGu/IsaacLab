@@ -535,6 +535,7 @@ class OnPolicyRunnerBYOL(OnPolicyRunner):
         )
 
         return alg
+    
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         # Augment loss_dict with BYOL EMA and suggested terrain level, if available
         try:

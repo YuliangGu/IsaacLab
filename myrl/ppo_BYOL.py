@@ -577,6 +577,8 @@ class PPOWithBYOL(PPO):
         self.ctx_h = None
         self.a_prev = None
         self.ctx_buf = None
+        self.cnts = 0
+        self.total_num_iters = 1500 # NOTE: hardcoded for now
 
     def _zero_ctx(self):
         if not self.enable_byol:
@@ -625,7 +627,7 @@ class PPOWithBYOL(PPO):
     def act(self, obs):
         """Overriden to infer context first when BYOL is enabled."""
         if self.enable_byol:
-            ct = self._infer(obs)            # infer belief before sampling
+            ct = self._infer(obs)            # infer belief before sampling. shape: [num_envs, z_dim]
             self.ctx_buf[self.storage.step] = ct
             self.policy.set_belief(ct)
         actions = super().act(obs)
@@ -662,9 +664,9 @@ class PPOWithBYOL(PPO):
         if self.enable_byol and self.byol is not None:
             self.byol.train()  # sets BN to train mode
 
-        # TODO: anneal tau
         if self.byol_tau_start != self.byol_tau_end:
-            pass
+            p = self.cnts / float(self.total_num_iters)
+            self.byol.tau = self.byol_tau_start + p * (self.byol_tau_end - self.byol_tau_start)
 
         # Get raw data from storage for BYOL sampling (only if enabled)
         if self.enable_byol:
@@ -844,23 +846,17 @@ class PPOWithBYOL(PPO):
             "approx_kl": approx_kl.item(),
             "old_approx_kl": old_approx_kl.item(),
             "clipfrac": np.mean(clipfracs),
+            "byol_tau": self.byol.tau,
         }
 
         # # attach diagnostics if available
         if self.enable_byol:
-        # if ctx_norm_mean is not None:
-        #     loss_dict["ctx_norm_mean"] = ctx_norm_mean
-        # if ctx_norm_std is not None:
-        #     loss_dict["ctx_norm_std"] = ctx_norm_std
-        # if ctx_cos_prev is not None:
-        #     loss_dict["ctx_cos_prev"] = ctx_cos_prev
-        # if ctx_reset_frac is not None:
-        #     loss_dict["ctx_reset_frac"] = ctx_reset_frac
             if byol_mismatch is not None:
                 loss_dict["byol_mismatch"] = byol_mismatch
 
         # clear storage
         self._zero_ctx()
         self.storage.clear()
+        self.cnts += 1
 
         return loss_dict

@@ -52,6 +52,8 @@ class FiLM(nn.Module):
     """
     Feature-wise Linear Modulation: z' = (1 + gamma(c)) ⊙ z + beta(c).
     Stable, simple conditioning for belief/context vectors.
+
+    See: https://arxiv.org/abs/1709.07871
     """
     def __init__(self, ctx_dim: int, feat_dim: int):
         super().__init__()
@@ -135,6 +137,8 @@ class SeqEncoder(nn.Module):
 class BYOLSeq(nn.Module):
     """
     Temporal BYOL on vector sequences with optional action conditioning.
+
+    Original BYOL paper: https://arxiv.org/abs/2006.07733
     """
     def __init__(self,
                  obs_encoder: ObsEncoder,
@@ -468,6 +472,9 @@ def _time_warp(x: torch.Tensor, max_scale: float, rng: torch.Generator) -> torch
     """
     Monotonic time warp: resample each sequence by a random global speed in [1-max_scale, 1+max_scale],
     then linearly re-interpolate back to the original length. x: [B,T,D] -> [B,T,D]
+
+    NOTE: 
+        This operation is quite expensive (slow).
     """
     if max_scale <= 0: return x
     B, T, D = x.shape
@@ -485,6 +492,77 @@ def _time_warp(x: torch.Tensor, max_scale: float, rng: torch.Generator) -> torch
         w = (t_in - t0.float()).unsqueeze(-1)
         out[b] = (1 - w) * x[b, t0] + w * x[b, t1]
     return out
+
+def _channel_dropout_inplace(x: torch.Tensor, p: float, rng: torch.Generator) -> None:
+    """Drop entire feature channels consistently over time: mask shape [B,1,D]. In-place on x: [B,T,D]."""
+    if p <= 0: 
+        return
+    B, T, D = x.shape
+    mask = (_rand_gen((B, 1, D), x.device, rng) >= p).to(x.dtype)
+    x.mul_(mask)
+
+def _time_mask_inplace(x: torch.Tensor, span: int, prob: float, rng: torch.Generator) -> None:
+    """Randomly zero a contiguous time span per sequence with probability `prob`.
+    Args:
+        x: [B,T,D]
+        span: maximum span length to mask (clip to [1,T])
+        prob: probability to apply one span mask per sequence
+    """
+    if prob <= 0 or span <= 0:
+        return
+    B, T, D = x.shape
+    span = max(1, min(int(span), T))
+    # for each sequence, decide whether to mask and pick a start
+    apply = _rand_gen((B,), x.device, rng) < prob
+    if not torch.any(apply):
+        return
+    starts = torch.randint(0, max(1, T - span + 1), (B,), device=x.device, generator=rng)
+    for b in torch.nonzero(apply, as_tuple=False).flatten():
+        s = int(starts[b].item())
+        x[b, s:s+span, :] = 0
+
+def _calibration_noise_inplace(x: torch.Tensor, gain_std: float, bias_std: float, rng: torch.Generator) -> None:
+    """Apply per-channel gain/bias perturbation consistent over time: x <- (1+g)*x + b.
+    g, b have shape [B,1,D]. In-place on x: [B,T,D]."""
+    if gain_std <= 0 and bias_std <= 0:
+        return
+    B, T, D = x.shape
+    if gain_std > 0:
+        g = _randn_like_gen(x.new_empty((B, 1, D)), rng) * gain_std
+    else:
+        g = x.new_zeros((B, 1, D))
+    if bias_std > 0:
+        b = _randn_like_gen(x.new_empty((B, 1, D)), rng) * bias_std
+    else:
+        b = x.new_zeros((B, 1, D))
+    x.mul_(1.0 + g).add_(b)
+
+def _smooth_time_inplace(x: torch.Tensor, kernel_size: int, prob: float) -> None:
+    """Optionally low-pass filter along time using a depthwise 1D conv with triangular kernel.
+    Args:
+        x: [B,T,D]
+        kernel_size: odd int >=3; if <=0 no-op
+        prob: apply smoothing with this probability
+    """
+    if kernel_size <= 1 or prob <= 0:
+        return
+    B, T, D = x.shape
+    # coin flip once per batch to avoid per-sample branching
+    if torch.rand((), device=x.device) >= prob:
+        return
+    K = int(kernel_size)
+    if K % 2 == 0:
+        K += 1
+    # triangular kernel
+    base = torch.arange(1, (K//2)+2, device=x.device, dtype=x.dtype)
+    kernel = torch.cat([base, base[:-1].flip(0)])
+    kernel = (kernel / kernel.sum()).view(1, 1, K)
+    # depthwise conv over [B,D,T]
+    x_t = x.permute(0, 2, 1)  # [B,D,T]
+    weight = kernel.expand(D, 1, K)
+    pad = K // 2
+    x_t = torch.nn.functional.conv1d(x_t, weight, padding=pad, groups=D)
+    x.copy_(x_t.permute(0, 2, 1))
 
 @torch.no_grad()
 def _valid_window_starts(dones: torch.Tensor, W: int) -> np.ndarray:
@@ -520,6 +598,17 @@ def sample_byol_windows(
     time_warp_scale: float,
     device: torch.device,
     actions: Optional[torch.Tensor] = None,  # [T,N,A] or None
+
+    # Extra augmentations (all optional; default disabled)
+    ch_drop: float = 0.0,
+    time_mask_prob: float = 0.0,
+    time_mask_span: int = 0,
+    gain_std: float = 0.0,
+    bias_std: float = 0.0,
+    smooth_prob: float = 0.0,
+    smooth_kernel: int = 0,
+    mix_strength: float = 0.0,
+    
 ) -> Tuple[
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -560,6 +649,15 @@ def sample_byol_windows(
 
     _feature_jitter(v1o, noise_std, feat_drop, g1)
     _feature_jitter(v2o, noise_std, feat_drop, g2)
+    # calibration (per-channel gain/bias)
+    _calibration_noise_inplace(v1o, gain_std, bias_std, g1)
+    _calibration_noise_inplace(v2o, gain_std, bias_std, g2)
+    # channel-consistent dropout
+    _channel_dropout_inplace(v1o, ch_drop, g1)
+    _channel_dropout_inplace(v2o, ch_drop, g2)
+    # time-span masking
+    _time_mask_inplace(v1o, time_mask_span, time_mask_prob, g1)
+    _time_mask_inplace(v2o, time_mask_span, time_mask_prob, g2)
     _frame_drop_inplace(v1o, frame_drop, g1)
     _frame_drop_inplace(v2o, frame_drop, g2)
 
@@ -570,6 +668,15 @@ def sample_byol_windows(
     if time_warp_scale > 0: # do time warping
         v1o = _time_warp(v1o, time_warp_scale, g1)
         v2o = _time_warp(v2o, time_warp_scale, g2)
+
+    # temporal mixing (small strength recommended)
+    if mix_strength > 0.0:
+        v1o = _temporal_mixing(v1o, mix_strength, g1)
+        v2o = _temporal_mixing(v2o, mix_strength, g2)
+
+    # optional smoothing at the end
+    _smooth_time_inplace(v1o, smooth_kernel, smooth_prob)
+    _smooth_time_inplace(v2o, smooth_kernel, smooth_prob)
 
     if actions is None:
         return v1o, v2o, picks, len(picks)
