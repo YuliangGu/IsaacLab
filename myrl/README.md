@@ -11,7 +11,7 @@ plus a runner that wires everything together.
 
 - Temporal BYOL over windowed observation (and optional action) sequences
 - Optional encoder sharing between PPO and BYOL (toggleable)
-- Context/belief injection into the policy via FiLM or concat
+- Context/belief injection into the policy (optional:critic) via FiLM or concat
 - Lightweight diagnostics: BYOL mismatch, etc.
 - BYOL-driven curriculum suggestion (EMA-based) in the runner (optional)
 
@@ -59,22 +59,17 @@ isaaclab.bat -p scripts\reinforcement_learning\rsl_rl\train_byol.py --task  Isaa
 - `ctx_dim`: match `byol_z_dim`
 - `feat_dim`: encoder output dim
 - `use_prev_action`: include previous action via an action encoder
+- `ctx_to_critic`: inject context to critic
 
 ## Diagnostics
 
 The algorithm logs additional metrics when BYOL is enabled:
-- `ctx_norm_mean`, `ctx_norm_std`: context L2 norm stats
-- `ctx_cos_prev`: temporal cosine similarity of successive contexts
 - `byol_mismatch`: small-sample BYOL target mismatch
 - Runner adds `byol_ema` (EMA of mismatch) and `terrain_level_suggested` (if enabled)
 
-## Notes
-
-- For PPO baselines: disable BYOL and consider using `ActorCritic` instead of `ActorCriticAug`.
-- With shared encoders, keep `byol_lambda` modest and consider detaching BYOL gradients if you observe interference.
-- For curriculum integration, see `OnPolicyRunnerBYOL.log` where BYOL EMA is mapped to a suggested terrain level.
+## TODOs:
+- 
 
 ## License
-
 This package follows the Isaac Lab project licensing.
 

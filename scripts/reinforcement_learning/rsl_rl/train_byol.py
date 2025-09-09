@@ -216,7 +216,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create runner (use BYOL runner if BYOL algorithm is requested)
     if agent_cfg.class_name == "OnPolicyRunnerBYOL":
         agent_cfg.num_steps_per_env = 50
-        agent_cfg.algorithm.desired_kl = 0.02 # default was 0.01
+        agent_cfg.algorithm.desired_kl = 0.015 # default was 0.01
         agent_cfg.algorithm.value_loss_coef = 0.5 # default was 1.0
         agent_cfg.algorithm.normalize_advantage_per_mini_batch = True # default was False
         runner = OnPolicyRunnerBYOL(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)

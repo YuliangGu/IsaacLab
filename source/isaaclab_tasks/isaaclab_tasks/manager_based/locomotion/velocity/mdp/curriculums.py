@@ -80,11 +80,28 @@ def terrain_levels_vel_dist(
         ** learnability **: the distance the robot walked when commanded to move at a desired velocity.
         ** uncertainty [optional] **: BYOL prediction error (intrinsic uncertainty by representation learning).
     """
-
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
     terrain: TerrainImporter = env.scene.terrain
     command = env.command_manager.get_command("base_velocity")
+
+    max_level = 3
+    low_level = 1
+    resolution = 0.5
+    terrain_set = torch.arange(low_level, max_level + resolution, resolution)
+
+    # LEARNABILITY CRITERION: update terrain levels based on distance
+    distance = torch.norm(asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1)
+
+    # thresholds for "good": walked half of required distance
+    good_threshold = distance > terrain.cfg.terrain_generator.size[0] / 2
+
+    # get levels that are "good"
+
+
+    current_levels = terrain.terrain_levels[env_ids]
+
+
 
     # get terrain levels
     terrain_levels = terrain.terrain_levels[env_ids]

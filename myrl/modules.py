@@ -183,6 +183,7 @@ class ActorCriticAug(ActorCritic):
                  ctx_mode: str = "concat",      # 'none'|'concat'|'film'
                  ctx_dim: int = 0,
                  feat_dim: Optional[int] = 128,  # ObsEncoder output dim; defaults to obs dim
+                 ctx_to_critic: bool = False,
                  **kwargs):
         """Augmented ActorCritic compatible with rsl-rl.
 
@@ -191,6 +192,7 @@ class ActorCriticAug(ActorCritic):
             ctx_mode (str): Context mode to use ('none', 'concat', 'film').
             ctx_dim (int): Dimension of the context vector.
             feat_dim (Optional[int]): Feature dimension for the encoder. If None, defaults to observation dimension.
+            ctx_to_critic (bool): Whether to also feed context to critic (default: False).
 
         Description:
             Features: x_t -> encoder -> z_t
@@ -216,6 +218,7 @@ class ActorCriticAug(ActorCritic):
         self.use_prev_action = bool(use_prev_action)
         self.ctx_mode = str(ctx_mode)
         self.ctx_dim = int(ctx_dim)
+        self.ctx_to_critic = bool(ctx_to_critic)
 
         # optional modules
         self.aenc = ActionEncoder(self._act_dim, self.encoder.out_dim) if self.use_prev_action else None
@@ -332,6 +335,8 @@ class ActorCriticAug(ActorCritic):
         base = self.get_critic_obs_raw(obs)
         a_prev = self._prev_action
         c = self._ctx
+        if not self.ctx_to_critic:
+            c = None
         return self._features(base, a_prev, c)
 
     # --- normalization updates over features ---

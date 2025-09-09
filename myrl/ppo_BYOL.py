@@ -492,6 +492,14 @@ class PPOWithBYOL(PPO):
             byol_time_warp_scale: float = 0.01,
             byol_feat_drop: float = 0.1,
             byol_frame_drop: float = 0.1,
+            byol_ch_drop: float = 0.05,
+            byol_time_mask_prob: float = 0.1,
+            byol_time_mask_span: int = 2,
+            byol_gain_std: float = 0.05,
+            byol_bias_std: float = 0.02,
+            byol_smooth_prob: float = 0.25,
+            byol_smooth_kernel: int = 3,
+            byol_mix_strength: float = 0.0,
             byol_use_actions: bool = True,
             # passthrough PPO kwargs (e.g., device, lr, clips)
             **ppo_kwargs,
@@ -507,7 +515,6 @@ class PPOWithBYOL(PPO):
         if self.enable_byol and not isinstance(self.policy, ActorCriticAug):
             raise ValueError("PPOWithBYOL with BYOL enabled requires the policy to be ActorCriticAug")
 
-
         self.share_byol_encoder = share_byol_encoder
         self.byol_lambda = byol_lambda
         self.byol_window = byol_window
@@ -521,10 +528,17 @@ class PPOWithBYOL(PPO):
         self.byol_time_warp_scale = byol_time_warp_scale
         self.byol_feat_drop = byol_feat_drop
         self.byol_frame_drop = byol_frame_drop
+        self.byol_ch_drop = byol_ch_drop
+        self.byol_time_mask_prob = byol_time_mask_prob
+        self.byol_time_mask_span = byol_time_mask_span
+        self.byol_gain_std = byol_gain_std
+        self.byol_bias_std = byol_bias_std
+        self.byol_smooth_prob = byol_smooth_prob
+        self.byol_smooth_kernel = byol_smooth_kernel
+        self.byol_mix_strength = byol_mix_strength
         self.byol_use_actions = byol_use_actions
 
         if self.enable_byol:
-            # Build BYOL encoders
             if self.share_byol_encoder:
                 byol_obs_encoder = self.policy.encoder
                 print("[PPOWithBYOL] sharing observation encoder between policy and BYOL")
@@ -558,20 +572,38 @@ class PPOWithBYOL(PPO):
             self.byol.f_targ.eval()
             self.byol.g_targ.eval()
 
-            if self.share_byol_encoder:
-                joint_params = list(self.policy.parameters()) + self.byol.online_parameters(include_obs_encoder=False)
-                if self.byol.f_online.action_encoder is not None:
-                    joint_params += list(self.byol.f_online.action_encoder.parameters())
-            else:
-                joint_params = list(self.policy.parameters()) + self.byol.online_parameters(include_obs_encoder=True)
-
-            self.param_to_clip = joint_params
-            self.optimizer = optim.Adam(joint_params, lr=self.learning_rate)  # override
+        """       Optimizer with parameter groups and LR multipliers. Different LR for:
+                - shared encoder (if any)
+                - actor (mean + log/std) and critic
+                - BYOL (if any)
+        """
+        enc = list(self.policy.encoder.parameters())                      # shared
+        heads = list(self.policy.actor.parameters()) + list(self.policy.critic.parameters())
+        if self.policy.noise_std_type == 'scalar': # add nn.Parameter noise_std to optimizer if applicable
+            heads += [self.policy.std]
         else:
-            # BYOL disabled: plain PPO
-            self.byol = None
-            self.param_to_clip = list(self.policy.parameters())
-            self.optimizer = optim.Adam(self.param_to_clip, lr=self.learning_rate)
+            heads += [self.policy.log_std]
+        byol_params = self.byol.online_parameters(include_obs_encoder=False) if self.enable_byol else []
+
+        enc_mult  = ppo_kwargs.get("lr_mult_encoder", 0.5)   # e.g., 0.5
+        byol_mult = ppo_kwargs.get("lr_mult_byol",    1.0)   # e.g., 1.0
+
+        param_groups = [
+            {"params": enc,        "lr": self.learning_rate * enc_mult, "tag":"policy"},
+            {"params": heads,      "lr": self.learning_rate, "tag":"policy"},]
+        if byol_params:
+            param_groups.append({"params": byol_params, "lr": self.learning_rate * byol_mult, "tag":"byol"})
+
+        self.optimizer = optim.Adam(param_groups)
+        self._base_group_lrs = [g['lr'] for g in self.optimizer.param_groups]
+        self._base_policy_lr = self.learning_rate
+
+        self.param_to_clip = enc + heads + byol_params
+        
+        # print optimizer info
+        print(f"[PPOWithBYOL] Optimizer param groups:")
+        for i, g in enumerate(self.optimizer.param_groups):
+            print(f"  group {i}: lr={g['lr']}, num_params={len(g['params'])}")
 
         # lazy init
         self.ctx_h = None
@@ -713,31 +745,91 @@ class PPOWithBYOL(PPO):
 
         byol_mismatch = None # for logging and curriculum (not implemented yet)
         if self.enable_byol:
-            try:
-                diag_B = min(128, batch_size)
-                if self.byol_use_actions:
-                    v1_d, v2_d, _, _ = sample_byol_windows(
-                        obs_raw, dones_raw, self.byol_window, diag_B,
-                        max_shift=self.byol_max_shift, noise_std=self.byol_noise_std,
+            diag_B = min(128, batch_size)
+            if self.byol_use_actions:
+                v1_d, v2_d, _, _ = sample_byol_windows(
+                        obs=obs_raw, dones=dones_raw, W=self.byol_window, B=diag_B,
+                        max_shift=self.byol_max_shift, 
+                        noise_std=self.byol_noise_std,
+                        feat_drop=self.byol_feat_drop, 
+                        frame_drop=self.byol_frame_drop,
                         time_warp_scale=self.byol_time_warp_scale,
-                        feat_drop=self.byol_feat_drop, frame_drop=self.byol_frame_drop,
+                        ch_drop=self.byol_ch_drop,
+                        time_mask_prob=self.byol_time_mask_prob,
+                        time_mask_span=self.byol_time_mask_span,
+                        gain_std=self.byol_gain_std,
+                        bias_std=self.byol_bias_std,
+                        smooth_prob=self.byol_smooth_prob,
+                        smooth_kernel=self.byol_smooth_kernel,
+                        mix_strength=self.byol_mix_strength,
                         device=self.device,
-                        actions=self.storage.actions,  # <---- pass [T,N,A]
+                        actions=self.storage.actions,
                     )
-                else:
-                    v1_d, v2_d, _, _ = sample_byol_windows(
-                        obs_raw, dones_raw, self.byol_window, diag_B,
-                        max_shift=self.byol_max_shift, noise_std=self.byol_noise_std,
+            else:
+                v1_d, v2_d, _, _ = sample_byol_windows(
+                        obs=obs_raw, dones=dones_raw, W=self.byol_window, B=diag_B,
+                        max_shift=self.byol_max_shift, 
+                        noise_std=self.byol_noise_std,
+                        feat_drop=self.byol_feat_drop, 
+                        frame_drop=self.byol_frame_drop,
                         time_warp_scale=self.byol_time_warp_scale,
-                        feat_drop=self.byol_feat_drop, frame_drop=self.byol_frame_drop,
+                        ch_drop=self.byol_ch_drop,
+                        time_mask_prob=self.byol_time_mask_prob,
+                        time_mask_span=self.byol_time_mask_span,
+                        gain_std=self.byol_gain_std,
+                        bias_std=self.byol_bias_std,
+                        smooth_prob=self.byol_smooth_prob,
+                        smooth_kernel=self.byol_smooth_kernel,
+                        mix_strength=self.byol_mix_strength,
                         device=self.device,
+                        actions=None,
                     )
-                with torch.no_grad():
-                    byol_mismatch = self.byol.mismatch_per_window(v1_d, v2_d).mean().item()
-            except Exception:
-                byol_mismatch = None
+            with torch.no_grad():
+                byol_mismatch = self.byol.mismatch_per_window(v1_d, v2_d).mean().item()
 
         for _ in range(self.num_learning_epochs):
+            cached_v1_v2 = None
+            if self.enable_byol and (self.byol_lambda > 0):
+                B = min(self.byol_batch if self.byol_batch > 0 else mini_batch_size, 512)
+                if self.byol_use_actions:
+                    cached_v1_v2 = sample_byol_windows(
+                        obs=obs_raw, dones=dones_raw, W=self.byol_window, B=B,
+                        max_shift=self.byol_max_shift, 
+                        noise_std=self.byol_noise_std,
+                        feat_drop=self.byol_feat_drop, 
+                        frame_drop=self.byol_frame_drop,
+                        time_warp_scale=self.byol_time_warp_scale,
+                        ch_drop=self.byol_ch_drop,
+                        time_mask_prob=self.byol_time_mask_prob,
+                        time_mask_span=self.byol_time_mask_span,
+                        gain_std=self.byol_gain_std,
+                        bias_std=self.byol_bias_std,
+                        smooth_prob=self.byol_smooth_prob,
+                        smooth_kernel=self.byol_smooth_kernel,
+                        mix_strength=self.byol_mix_strength,
+                        device=self.device,
+                        actions=self.storage.actions,
+                    )
+                else:
+                    cached_v1_v2 = sample_byol_windows(
+                        obs=obs_raw, dones=dones_raw, W=self.byol_window, B=B,
+                        max_shift=self.byol_max_shift, 
+                        noise_std=self.byol_noise_std,
+                        feat_drop=self.byol_feat_drop, 
+                        frame_drop=self.byol_frame_drop,
+                        time_warp_scale=self.byol_time_warp_scale,
+                        ch_drop=self.byol_ch_drop,
+                        time_mask_prob=self.byol_time_mask_prob,
+                        time_mask_span=self.byol_time_mask_span,
+                        gain_std=self.byol_gain_std,
+                        bias_std=self.byol_bias_std,
+                        smooth_prob=self.byol_smooth_prob,
+                        smooth_kernel=self.byol_smooth_kernel,
+                        mix_strength=self.byol_mix_strength,
+                        device=self.device,
+                        actions=None,
+                    )
+
             for i in range(self.num_mini_batches):
                 start = i * mini_batch_size
                 end = (i + 1) * mini_batch_size
@@ -755,10 +847,18 @@ class PPOWithBYOL(PPO):
                 logratio = newlogprobs - torch.squeeze(b_logprobs[mb_inds])
                 ratio = logratio.exp()
 
+                """ adaptive LR and BYOL loss lambda"""
                 with torch.no_grad():
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > self.clip_param).float().mean().item()]
+
+                    if self.enable_byol and byol_mismatch is not None:
+                        # low, high = 0.02, 0.3
+                        # w = float((min(max(byol_mismatch, low), high) - low) / (high - low))
+                        # w = max(0.1, min(1.0, w))
+                        w = 1.0
+                        lambda_now = self.byol_lambda * w
 
                     if self.desired_kl is not None and self.schedule == "adaptive":
                         if approx_kl > self.desired_kl * 2.0:
@@ -766,8 +866,13 @@ class PPOWithBYOL(PPO):
                         elif approx_kl < self.desired_kl / 2.0 and approx_kl > 0.0:
                             self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
-                        for param_group in self.optimizer.param_groups:
-                            param_group["lr"] = self.learning_rate
+                        # Update the learning rate based on param groups
+                        scale = self.learning_rate / max(1e-12, self._base_policy_lr)
+                        for pg, base in zip(self.optimizer.param_groups, self._base_group_lrs):
+                            if pg.get("tag", "policy") == "policy":
+                                pg["lr"] = base * scale
+                            else:  # keep other groups (e.g., BYOL) unchanged
+                                pass
                 
                 mb_adv = b_advantages[mb_inds]
                 if self.normalize_advantage_per_mini_batch:
@@ -789,30 +894,12 @@ class PPOWithBYOL(PPO):
 
                 entropy_loss = entropy.mean()
 
-                aux_B = (2 * mini_batch_size) if self.byol_batch < 0 else self.byol_batch
-                aux_B = min(aux_B, 1024)
-                byol_loss_val = torch.tensor(0.0, device=self.device)
-                if self.enable_byol and (self.byol_lambda > 0):
-                    if self.byol_use_actions:
-                        v1, v2, _, _ = sample_byol_windows(
-                            obs_raw, dones_raw, self.byol_window, aux_B,
-                            max_shift=self.byol_max_shift, noise_std=self.byol_noise_std,
-                            time_warp_scale=self.byol_time_warp_scale,
-                            feat_drop=self.byol_feat_drop, frame_drop=self.byol_frame_drop,
-                            device=self.device,
-                            actions=self.storage.actions,  # <---- pass [T,N,A]
-                        )
-                    else:
-                        v1, v2, _, _ = sample_byol_windows(
-                            obs_raw, dones_raw, self.byol_window, aux_B,
-                            max_shift=self.byol_max_shift, noise_std=self.byol_noise_std,
-                            time_warp_scale=self.byol_time_warp_scale,
-                            feat_drop=self.byol_feat_drop, frame_drop=self.byol_frame_drop,
-                            device=self.device
-                        )
+                # BYOL loss
+                if cached_v1_v2 is not None:
+                    v1, v2, _, _ = cached_v1_v2
                     byol_loss_val = self.byol.loss(v1, v2)
 
-                loss = pg_loss + self.value_loss_coef * v_loss - self.entropy_coef * entropy_loss + self.byol_lambda * byol_loss_val
+                loss = pg_loss + self.value_loss_coef * v_loss - self.entropy_coef * entropy_loss + lambda_now * byol_loss_val
 
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -833,6 +920,7 @@ class PPOWithBYOL(PPO):
             "old_approx_kl": old_approx_kl.item(),
             "clipfrac": np.mean(clipfracs),
             "byol_tau": self.byol.tau,
+            "byol_lambda": lambda_now,
         }
 
         # # attach diagnostics if available

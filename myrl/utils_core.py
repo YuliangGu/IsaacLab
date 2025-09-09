@@ -603,9 +603,6 @@ def sample_byol_windows(
     W: int, B: int, max_shift: int,
     noise_std: float, feat_drop: float, frame_drop: float,
     time_warp_scale: float,
-    device: torch.device,
-    actions: Optional[torch.Tensor] = None,  # [T,N,A] or None
-
     # Extra augmentations (all optional; default disabled)
     ch_drop: float = 0.0,
     time_mask_prob: float = 0.0,
@@ -615,7 +612,8 @@ def sample_byol_windows(
     smooth_prob: float = 0.0,
     smooth_kernel: int = 0,
     mix_strength: float = 0.0,
-
+    device: torch.device = torch.device("cpu"),
+    actions: Optional[torch.Tensor] = None,  # [T,N,A] or None
 ) -> Tuple[
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -640,7 +638,7 @@ def sample_byol_windows(
 
         ch_drop: per-sequence channel dropout probability (consistent over time)
         time_mask_prob: per-sequence probability to apply a random time-span mask
-        time_mask_span: max length of time-span mask (in frames)
+        time_mask_span: max length of time-span mask (in frames: use W//8, e.g., W=16 -> span=2)
         gain_std: per-sequence per-channel gain noise stddev (consistent over time)
         bias_std: per-sequence per-channel bias noise stddev (consistent over time)
         smooth_prob: per-batch probability to apply low-pass smoothing
