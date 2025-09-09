@@ -324,35 +324,14 @@ class ActorCriticAug(ActorCritic):
     # --- rsl-rl observation hooks ---
     def get_actor_obs(self, obs):
         base = self.get_actor_obs_raw(obs)
-
         a_prev = self._prev_action
         c = self._ctx
-        if a_prev is not None and a_prev.shape[0] != base.shape[0]:
-            if a_prev.shape[0] == 1:
-                a_prev = a_prev.expand(base.shape[0], -1)
-            else:
-                a_prev = None
-        if c is not None and c.shape[0] != base.shape[0]:
-            if c.shape[0] == 1:
-                c = c.expand(base.shape[0], -1)
-            else:
-                c = None
         return self._features(base, a_prev, c)
 
     def get_critic_obs(self, obs):
         base = self.get_critic_obs_raw(obs)
         a_prev = self._prev_action
         c = self._ctx
-        if a_prev is not None and a_prev.shape[0] != base.shape[0]:
-            if a_prev.shape[0] == 1:
-                a_prev = a_prev.expand(base.shape[0], -1)
-            else:
-                a_prev = None
-        if c is not None and c.shape[0] != base.shape[0]:
-            if c.shape[0] == 1:
-                c = c.expand(base.shape[0], -1)
-            else:
-                c = None
         return self._features(base, a_prev, c)
 
     # --- normalization updates over features ---
@@ -372,8 +351,7 @@ class ActorCriticAug(ActorCritic):
         self._prev_action = a_prev
 
     def _ensure_built(self, obs_actor: torch.Tensor):
-        # present for compatibility; this class builds everything at init
-        return None
+        return
 
 
 # # --- policy with shared encoder & belief injection ---

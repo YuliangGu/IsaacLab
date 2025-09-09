@@ -476,7 +476,6 @@ class OnPolicyRunnerBYOL(OnPolicyRunner):
         self._byol_z_score = None
 
     def learn(self, num_learning_iterations, init_at_random_ep_len = False):
-        # Delegate to the base implementation; PPOWithBYOL manages BYOL internals.
         return super().learn(num_learning_iterations, init_at_random_ep_len)
 
     def _construct_algorithm(self, obs) -> PPOWithBYOL:

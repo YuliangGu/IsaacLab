@@ -590,13 +590,11 @@ class PPOWithBYOL(PPO):
         self.policy.set_prev_action(a_prev)
 
     def init_storage(self, *args, **kwargs):
-        # override to init rollout storage
         super(PPOWithBYOL, self).init_storage(*args, **kwargs)
 
         if not self.enable_byol:
             return
-
-        # init context buffer
+        
         self.ctx_buf = torch.zeros(
             self.storage.num_transitions_per_env,
             self.storage.num_envs,
@@ -604,12 +602,10 @@ class PPOWithBYOL(PPO):
             device=self.device,
         )
 
-        # init context state
         if getattr(self.policy, "ctx_mode", None) in ["film", "concat"]:
             print("[PPO-BYOL] context mode:", self.policy.ctx_mode)
             self._zero_ctx()
         else:
-            # If policy doesn't support context injection, warn only when BYOL is enabled
             raise NotImplementedError(f"ctx_mode {self.policy.ctx_mode} not implemented")
         
 
@@ -617,32 +613,47 @@ class PPOWithBYOL(PPO):
         super().process_env_step(obs, rewards, dones, extras)
         """ Overriden to reset BYOL GRU state on env done. """
         if self.ctx_h is not None:
-            d = dones
-            if d.dim() == 2 and d.shape[-1] == 1:
-                d = d.squeeze(-1)
-            d = d.to(torch.bool).to(self.ctx_h.device).view(-1)
+            d = dones.squeeze(-1).to(torch.bool)  # [N]
             if d.any():
-                self.ctx_h[:, d, :] = 0.0  # shape: [1, N, z_dim]
+                self.ctx_h[:, d, :] = 0.0
+                if self.a_prev is not None:
+                    self.a_prev[d, :] = 0.0
+                    self.policy.set_prev_action(self.a_prev)
 
     def act(self, obs):
-        """Overriden to infer context first when BYOL is enabled."""
+        # Overriden to use BYOL to infer context first when BYOL is enabled.
         if self.enable_byol:
             ct = self._infer(obs)            # infer belief before sampling. shape: [num_envs, z_dim]
             self.ctx_buf[self.storage.step] = ct
             self.policy.set_belief(ct)
-        actions = super().act(obs)
-        self.a_prev = actions.detach()
-        self.policy.set_prev_action(self.a_prev)  # <-- feed prev action to policy if you set use_prev_action=True
-        return actions
+
+        # compute the actions and values
+        self.transition.actions = self.policy.act(obs).detach()
+        self.transition.values = self.policy.evaluate(obs).detach()
+        self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
+        self.transition.action_mean = self.policy.action_mean.detach()
+        self.transition.action_sigma = self.policy.action_std.detach()
+        # need to record obs before env.step()
+        self.transition.observations = obs
+
+        # record prev action
+        self.a_prev = self.transition.actions.clone()
+        self.policy.set_prev_action(self.a_prev)
+        return self.transition.actions
+
+    # def act(self, obs):
+    #     """Overriden to infer context first when BYOL is enabled."""
+    #     if self.enable_byol:
+    #         ct = self._infer(obs)            # infer belief before sampling. shape: [num_envs, z_dim]
+    #         self.ctx_buf[self.storage.step] = ct
+    #         self.policy.set_belief(ct)
+    #     actions = super().act(obs)
+    #     self.a_prev = actions.detach()
+    #     self.policy.set_prev_action(self.a_prev)  # <-- feed prev action to policy if you set use_prev_action=True
+    #     return actions
 
     def _infer(self, obs):
-        """ Infer latent context. 
-
-        Pipeline:
-        1) extract base obs (remove prev action, ctx)
-        2) encode obs with BYOL online encoder
-        3) update GRU state
-        4) set policy context
+        """ Infer latent context. Used during rollout to update GRU state.
         """
         base = self.policy.get_actor_obs_raw(obs)
         with torch.no_grad():
@@ -654,15 +665,25 @@ class PPOWithBYOL(PPO):
             c_t = self.ctx_h.squeeze(0).detach()
         return c_t
 
+    def compute_returns(self, obs):
+        # overriden to infer context for last step before bootstrapping value
+        if self.enable_byol:
+            ct = self._infer(obs)            # infer belief before sampling. shape: [num_envs, z_dim]
+            self.policy.set_belief(ct)
+        last_values = self.policy.evaluate(obs).detach()
+        self.storage.compute_returns(
+            last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
+        )
+
     def update(self):
         """Overriden to add BYOL loss when enabled; otherwise run PPO path here."""
 
         if self.rnd or self.symmetry or self.policy.is_recurrent:
             raise NotImplementedError("RND, symmetry, and recurrent policy not supported in PPOWithBYOL")
         
-        # set BYOL to training mode (if enabled)
+        # set BYOL to training mode (e.g., for BatchNorm)
         if self.enable_byol and self.byol is not None:
-            self.byol.train()  # sets BN to train mode
+            self.byol.train() 
 
         if self.byol_tau_start != self.byol_tau_end:
             p = self.cnts / float(self.total_num_iters)
@@ -670,12 +691,13 @@ class PPOWithBYOL(PPO):
 
         # Get raw data from storage for BYOL sampling (only if enabled)
         if self.enable_byol:
-            obs_raw, dones_raw = extract_policy_obs_and_dones(self.storage)  # [T, N, D], [T, N]
+            obs_raw = self.storage.observations['policy'] # [T, N, obs_dim]
+            dones_raw = self.storage.dones.squeeze(-1)  # [T, N]
         else:
             obs_raw, dones_raw = None, None
 
         # flatten the (T, N, ...) arrays to (T * N, ...) for PPO
-        b_obs = self.storage.observations.flatten(0, 1)
+        b_obs = self.storage.observations.flatten(0, 1) # NOTE: rsl-rl PPO agent uses 'obs' key. Others are 'normal'.
         b_logprobs = self.storage.actions_log_prob.flatten(0, 1)
         b_actions = self.storage.actions.flatten(0, 1)
         b_values = self.storage.values.flatten(0, 1)
@@ -683,44 +705,14 @@ class PPOWithBYOL(PPO):
         b_advantages = self.storage.advantages.flatten(0, 1)
         b_ctx = self.ctx_buf.reshape((-1, self.byol_z_dim)) if self.enable_byol else None
 
-        # Precompute episode-start mask for flattened indices [T*N].
-        # A step is an episode start if it's the first step (t==0) or the previous step was done.
-        T = self.storage.num_transitions_per_env
-        N = self.storage.num_envs
-        ep_start_flat = torch.zeros(T * N, dtype=torch.bool, device=self.device)
-        ep_start_flat[:N] = True  # first step of each env
-        if T > 1:
-            # Map dones[t-1, n] to flat indices of steps t>=1
-            ep_start_flat[N:] = self.storage.dones.squeeze()[:-1, :].reshape(-1).to(torch.bool)
-
         # Get raw data from storage
         batch_size = self.storage.num_envs * self.storage.num_transitions_per_env
         mini_batch_size = batch_size // self.num_mini_batches
         b_inds = torch.randperm(self.num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
         clipfracs = []
 
-        # # Diagnostics (computed once per update when BYOL is enabled)
-        # ctx_norm_mean = None
-        # ctx_norm_std = None
-        # ctx_cos_prev = None
-        # ctx_reset_frac = None
-        byol_mismatch = None
+        byol_mismatch = None # for logging and curriculum (not implemented yet)
         if self.enable_byol:
-            # with torch.no_grad():
-        #         # context norms over entire rollout buffer
-        #         norms = torch.norm(b_ctx, dim=1)
-        #         ctx_norm_mean = norms.mean().item()
-        #         ctx_norm_std = norms.std().item()
-        #         # fraction of episode-start steps in buffer
-        #         ctx_reset_frac = ep_start_flat.float().mean().item()
-        #         # cosine similarity of c_t with c_{t-1} (excluding episode starts)
-        #         if T > 1:
-        #             curr = self.ctx_buf[1:].reshape(-1, self.byol_z_dim)
-        #             prev = self.ctx_buf[:-1].reshape(-1, self.byol_z_dim)
-        #             mask = (~self.storage.dones.squeeze()[:-1, :].reshape(-1).to(torch.bool))
-        #             if mask.any():
-        #                 ctx_cos_prev = F.cosine_similarity(curr[mask], prev[mask], dim=-1).mean().item()
-        #     # quick BYOL mismatch on a small sample
             try:
                 diag_B = min(128, batch_size)
                 if self.byol_use_actions:
@@ -745,7 +737,7 @@ class PPOWithBYOL(PPO):
             except Exception:
                 byol_mismatch = None
 
-        for epoch in range(self.num_learning_epochs):
+        for _ in range(self.num_learning_epochs):
             for i in range(self.num_mini_batches):
                 start = i * mini_batch_size
                 end = (i + 1) * mini_batch_size
@@ -753,15 +745,8 @@ class PPOWithBYOL(PPO):
 
                 # Reset/set context only if BYOL is enabled
                 if self.enable_byol:
-                    mb_inds_t = torch.as_tensor(mb_inds, device=self.device, dtype=torch.long)
-                    ctx_mb = b_ctx.index_select(0, mb_inds_t)
-                    start_mask = ep_start_flat.index_select(0, mb_inds_t)
-                    if torch.any(start_mask):
-                        ctx_mb = ctx_mb.clone()
-                        ctx_mb[start_mask] = 0.0
-                    self.policy.set_belief(ctx_mb)
+                    self.policy.set_belief(b_ctx[mb_inds])
                 self.policy.act(b_obs[mb_inds])
-                # newlogprobs = self.policy.get_actions_log_prob(b_actions[mb_inds]).unsqueeze(1)
                 newlogprobs = self.policy.get_actions_log_prob(b_actions[mb_inds])
 
                 newvalue = self.policy.evaluate(b_obs[mb_inds])
@@ -804,7 +789,8 @@ class PPOWithBYOL(PPO):
 
                 entropy_loss = entropy.mean()
 
-                aux_B = self.byol_batch if self.byol_batch > 0 else mini_batch_size
+                aux_B = (2 * mini_batch_size) if self.byol_batch < 0 else self.byol_batch
+                aux_B = min(aux_B, 1024)
                 byol_loss_val = torch.tensor(0.0, device=self.device)
                 if self.enable_byol and (self.byol_lambda > 0):
                     if self.byol_use_actions:
@@ -833,7 +819,7 @@ class PPOWithBYOL(PPO):
                 nn.utils.clip_grad_norm_(self.param_to_clip, self.max_grad_norm)
                 self.optimizer.step()
             
-                # Update target networks with EMA
+                # Update target networks with EMA. TODO: every epoch or iteration?
                 if self.enable_byol and (self.byol_lambda > 0):
                     self.byol.ema_update()
 

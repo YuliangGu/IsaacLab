@@ -17,8 +17,8 @@ def mlp(in_dim: int, out_dim: int) -> nn.Sequential:
     """Light MLP head (used in BYOL)."""
     return nn.Sequential(
         nn.Linear(in_dim, 512),
-        nn.BatchNorm1d(512), # BatchNorm for heterogeneous data
-        # nn.LayerNorm(512),  # use LayerNorm instead of BatchNorm
+        # nn.BatchNorm1d(512), # BatchNorm for heterogeneous data
+        nn.LayerNorm(512),  # use LayerNorm instead of BatchNorm
         nn.ReLU(inplace=True),
         nn.Linear(512, out_dim),
     )
@@ -164,6 +164,13 @@ class BYOLSeq(nn.Module):
         print(f"[BYOLSeq] Initialized BYOLSeq model with:")
         print(f"BYOLSeq: {self}")
 
+    def train(self, mode: bool = True):
+        # Override to keep target networks in eval mode
+        super().train(mode)
+        self.f_targ.eval()
+        self.g_targ.eval()
+        return self
+    
     @torch.no_grad()
     def ema_update(self) -> None:
         """EMA update for target encoders."""
@@ -608,7 +615,7 @@ def sample_byol_windows(
     smooth_prob: float = 0.0,
     smooth_kernel: int = 0,
     mix_strength: float = 0.0,
-    
+
 ) -> Tuple[
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -617,7 +624,28 @@ def sample_byol_windows(
     ]:
     """
     Sample B window pairs (v1, v2) with independent augs.
-    If 'actions' is provided, returns tuples: (obs_seq, act_seq) for each view.
+    
+    Args:
+        obs: [T,N,D_obs] float tensor of observations
+        dones: [T,N] bool tensor with True where episode ended at t
+        W: window length
+        B: batch size (number of pairs)
+        max_shift: max temporal shift (frames) between v1 and v2; 0 = no shift
+        noise_std: per-frame Gaussian noise stddev
+        feat_drop: per-frame Bernoulli feature dropout probability
+        frame_drop: per-sequence Bernoulli frame-drop probability
+        time_warp_scale: max time warp scale (0 = no warp)
+        device: target device for output tensors
+        actions: optional [T,N,A] float tensor of actions (if provided, also return action windows)
+
+        ch_drop: per-sequence channel dropout probability (consistent over time)
+        time_mask_prob: per-sequence probability to apply a random time-span mask
+        time_mask_span: max length of time-span mask (in frames)
+        gain_std: per-sequence per-channel gain noise stddev (consistent over time)
+        bias_std: per-sequence per-channel bias noise stddev (consistent over time)
+        smooth_prob: per-batch probability to apply low-pass smoothing
+        smooth_kernel: odd kernel size >=3 for low-pass smoothing along time
+        mix_strength: strength of temporal mixing augmentation (0 = no mixing)
     """
     W_use = min(int(W), int(obs.shape[0]))
     starts = _valid_window_starts(dones, W_use)
@@ -631,7 +659,6 @@ def sample_byol_windows(
     T_total = obs.shape[0]
     for (s, n) in picks:
         w1o = obs[s : s + W_use, n, :].clone()
-        # w1o = obs[s : s + W, n, :].clone()
         delta = np.random.randint(-max_shift, max_shift + 1) if max_shift > 0 else 0
         s2 = max(0, min(s + delta, T_total - W_use))
         w2o = obs[s2 : s2 + W_use, n, :].clone()
@@ -649,28 +676,35 @@ def sample_byol_windows(
 
     _feature_jitter(v1o, noise_std, feat_drop, g1)
     _feature_jitter(v2o, noise_std, feat_drop, g2)
+
     # calibration (per-channel gain/bias)
     _calibration_noise_inplace(v1o, gain_std, bias_std, g1)
     _calibration_noise_inplace(v2o, gain_std, bias_std, g2)
+
     # channel-consistent dropout
     _channel_dropout_inplace(v1o, ch_drop, g1)
     _channel_dropout_inplace(v2o, ch_drop, g2)
+
     # time-span masking
     _time_mask_inplace(v1o, time_mask_span, time_mask_prob, g1)
     _time_mask_inplace(v2o, time_mask_span, time_mask_prob, g2)
+
+    # frame dropout (temporal consistency)
     _frame_drop_inplace(v1o, frame_drop, g1)
     _frame_drop_inplace(v2o, frame_drop, g2)
 
     if max_shift > 0:
+        # random temporal shift (independent for v1 and v2)
         v1o = _temporal_shift(v1o, int(torch.randint(-max_shift, max_shift + 1, (1,)).item()))
         v2o = _temporal_shift(v2o, int(torch.randint(-max_shift, max_shift + 1, (1,)).item()))
 
-    if time_warp_scale > 0: # do time warping
+    if time_warp_scale > 0:
+        # time warp (independent for v1 and v2)
         v1o = _time_warp(v1o, time_warp_scale, g1)
         v2o = _time_warp(v2o, time_warp_scale, g2)
 
-    # temporal mixing (small strength recommended)
     if mix_strength > 0.0:
+        # temporal mixing (independent for v1 and v2)
         v1o = _temporal_mixing(v1o, mix_strength, g1)
         v2o = _temporal_mixing(v2o, mix_strength, g2)
 

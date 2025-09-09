@@ -28,18 +28,32 @@ class UnitreeGo2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
 
         # NOTE: increase the DR scale for better generalization
         self.scene.terrain.terrain_generator.sub_terrains["boxes"].grid_height_range = (0.05, 0.2)
-        self.scene.terrain.terrain_generator.sub_terrains["random_rough"].noise_range = (0.02, 0.08)
+        self.scene.terrain.terrain_generator.sub_terrains["random_rough"].noise_range = (0.04, 0.08)
         self.scene.terrain.terrain_generator.sub_terrains["random_rough"].noise_step = 0.05
+
+        # Turn off privileged observations
+        self.observations.policy.height_scan = None
+
+        # no terrain curriculum
+        # self.curriculum.terrain_levels = None
 
         # reduce action scale
         self.actions.joint_pos.scale = 0.25
 
         # event
-        self.events.push_robot = None
         # self.events.add_base_mass.params["mass_distribution_params"] = (-1.0, 3.0)
-        self.events.add_base_mass.params["mass_distribution_params"] = (-2.0, 4.0)
+
+        # add some mass to the base
+        self.events.add_base_mass.params["mass_distribution_params"] = (-5.0, 5.0)
+
+        # apply forces at the base
         self.events.add_base_mass.params["asset_cfg"].body_names = "base"
-        self.events.base_external_force_torque.params["asset_cfg"].body_names = "base"
+
+        # push the robot by setting its base velocity
+        self.events.push_robot.params = {"velocity_range": 
+                                         {"x": (-1.0, 1.0), "y": (-1.0, 1.0)}}
+
+        # reset robot 
         self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
         self.events.reset_base.params = {
             "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},

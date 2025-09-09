@@ -212,9 +212,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.byol_debug:
             print("[BYOL DEBUG] Effective agent config after BYOL overlay:")
             print_dict(agent_cfg.to_dict(), nesting=4)
-            
+
     # create runner (use BYOL runner if BYOL algorithm is requested)
     if agent_cfg.class_name == "OnPolicyRunnerBYOL":
+        agent_cfg.num_steps_per_env = 50
+        agent_cfg.algorithm.desired_kl = 0.02 # default was 0.01
+        agent_cfg.algorithm.value_loss_coef = 0.5 # default was 1.0
+        agent_cfg.algorithm.normalize_advantage_per_mini_batch = True # default was False
         runner = OnPolicyRunnerBYOL(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "OnPolicyRunner":
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
@@ -222,6 +226,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+    
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
