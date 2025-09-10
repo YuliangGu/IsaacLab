@@ -475,6 +475,46 @@ class OnPolicyRunnerBYOL(OnPolicyRunner):
         self._byol_level_max = int(byol_curr_cfg.get("max_level", 8))
         self._byol_z_score = None
 
+    def save(self, path: str, infos=None):
+        # -- Save model
+        saved_dict = {
+            "model_state_dict": self.alg.policy.state_dict(),
+            "byol_state_dict": self.alg.byol.state_dict(),
+            "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "iter": self.current_learning_iteration,
+            "infos": infos,
+        }
+        # -- Save RND model if used
+        if hasattr(self.alg, "rnd") and self.alg.rnd:
+            saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
+            saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
+        torch.save(saved_dict, path)
+
+        # upload model to external logging service
+        if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
+            self.writer.save_model(path, self.current_learning_iteration)
+    
+    def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None):
+        loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
+        # -- Load model
+        resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
+        # -- Load BYOL model
+        self.alg.byol.load_state_dict(loaded_dict["byol_state_dict"])
+        # -- Load RND model if used
+        if hasattr(self.alg, "rnd") and self.alg.rnd:
+            self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+        # -- load optimizer if used
+        if load_optimizer and resumed_training:
+            # -- algorithm optimizer
+            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            # -- RND optimizer if used
+            if hasattr(self.alg, "rnd") and self.alg.rnd:
+                self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        # -- load current learning iteration
+        if resumed_training:
+            self.current_learning_iteration = loaded_dict["iter"]
+        return loaded_dict["infos"]
+
     def learn(self, num_learning_iterations, init_at_random_ep_len = False):
         return super().learn(num_learning_iterations, init_at_random_ep_len)
 

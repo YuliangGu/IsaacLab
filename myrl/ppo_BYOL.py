@@ -790,7 +790,7 @@ class PPOWithBYOL(PPO):
         for _ in range(self.num_learning_epochs):
             cached_v1_v2 = None
             if self.enable_byol and (self.byol_lambda > 0):
-                B = min(self.byol_batch if self.byol_batch > 0 else mini_batch_size, 512)
+                B = min(self.byol_batch if self.byol_batch > 0 else mini_batch_size, 2048)
                 if self.byol_use_actions:
                     cached_v1_v2 = sample_byol_windows(
                         obs=obs_raw, dones=dones_raw, W=self.byol_window, B=B,

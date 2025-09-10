@@ -193,6 +193,7 @@ class ActorCriticAug(ActorCritic):
             ctx_dim (int): Dimension of the context vector.
             feat_dim (Optional[int]): Feature dimension for the encoder. If None, defaults to observation dimension.
             ctx_to_critic (bool): Whether to also feed context to critic (default: False).
+            actor_layer_norm (bool): use a tiny layer norm if it takes context input (default: False).
 
         Description:
             Features: x_t -> encoder -> z_t

@@ -52,8 +52,8 @@ def terrain_levels_vel(
     # update terrain levels
 
     """ MODIFIED: randomly assign terrain levels (int) within valid range and update origins. """
-    max_level = 3
-    low_level = 1
+    max_level = 5
+    low_level = 0
 
     cur = terrain.terrain_levels[env_ids]
     new_levels = torch.randint(
