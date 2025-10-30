@@ -98,7 +98,8 @@ class OnPolicyRunner:
         for it in range(start_iter, tot_iter):
             start = time.time()
             # Rollout
-            with torch.inference_mode():
+            # with torch.inference_mode():
+            with torch.no_grad():
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
                     actions = self.alg.act(obs)
@@ -479,11 +480,12 @@ class OnPolicyRunnerBYOL(OnPolicyRunner):
         # -- Save model
         saved_dict = {
             "model_state_dict": self.alg.policy.state_dict(),
-            "byol_state_dict": self.alg.byol.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
+        if hasattr(self.alg, "byol") and self.alg.byol:
+            saved_dict["byol_state_dict"] = self.alg.byol.state_dict()
         # -- Save RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
@@ -499,7 +501,8 @@ class OnPolicyRunnerBYOL(OnPolicyRunner):
         # -- Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
         # -- Load BYOL model
-        self.alg.byol.load_state_dict(loaded_dict["byol_state_dict"])
+        if hasattr(self.alg, "byol") and self.alg.byol:
+            self.alg.byol.load_state_dict(loaded_dict["byol_state_dict"])
         # -- Load RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])

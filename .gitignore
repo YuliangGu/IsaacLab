@@ -69,3 +69,7 @@ tests/
 
 # Docker history
 .isaac-lab-docker-history
+
+# myrl backups
+**/myrl_backups/*
+**/myrl_backup/*

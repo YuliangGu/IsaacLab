@@ -209,16 +209,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg.class_name = "OnPolicyRunnerBYOL"
         agent_cfg.policy.class_name = "ActorCriticAug"
         agent_cfg.algorithm.class_name = "PPOWithBYOL"
+        agent_cfg.algorithm.desired_kl = 0.015 # default was 0.01
+        agent_cfg.algorithm.value_loss_coef = 1.0 # default was 1.0
+        agent_cfg.algorithm.max_grad_norm = 1.0 # default was 1.0
+        agent_cfg.algorithm.normalize_advantage_per_mini_batch = False # default was False
         if args_cli.byol_debug:
             print("[BYOL DEBUG] Effective agent config after BYOL overlay:")
             print_dict(agent_cfg.to_dict(), nesting=4)
 
-    # create runner (use BYOL runner if BYOL algorithm is requested)
     if agent_cfg.class_name == "OnPolicyRunnerBYOL":
-        agent_cfg.num_steps_per_env = 100
-        agent_cfg.algorithm.desired_kl = 0.01 # default was 0.01
-        agent_cfg.algorithm.value_loss_coef = 1.0 # default was 1.0
-        agent_cfg.algorithm.normalize_advantage_per_mini_batch = True # default was False
+        agent_cfg.num_steps_per_env = 50
+        agent_cfg.max_iterations = 1000
         runner = OnPolicyRunnerBYOL(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "OnPolicyRunner":
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)

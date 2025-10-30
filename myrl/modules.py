@@ -59,7 +59,7 @@ class ActorCritic(nn.Module):
             self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs)
         else:
             self.actor_obs_normalizer = torch.nn.Identity()
-        print(f"Actor MLP: {self.actor}")
+        # print(f"Actor MLP: {self.actor}")
 
         # critic
         self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
@@ -69,7 +69,7 @@ class ActorCritic(nn.Module):
             self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs)
         else:
             self.critic_obs_normalizer = torch.nn.Identity()
-        print(f"Critic MLP: {self.critic}")
+        # print(f"Critic MLP: {self.critic}")
 
         # Action noise
         self.noise_std_type = noise_std_type
@@ -242,6 +242,9 @@ class ActorCriticAug(ActorCritic):
         else:
             self.critic_obs_normalizer = torch.nn.Identity()
 
+        # modulate context usage over time
+        self._ctx_scale = 0.0 # NOTE: this should be set by algorithm over time
+
         # Runtime inputs set by algorithm (optional)
         self._ctx: Optional[torch.Tensor] = None
         self._prev_action: Optional[torch.Tensor] = None
@@ -252,7 +255,7 @@ class ActorCriticAug(ActorCritic):
         print("========================================================")
     
     def _draw_model_diagram(self):
-        """Print a detailed ASCII diagram of the end-to-end model workflow.
+        """Prints a diagram of the model architecture.
 
         Includes:
         - Policy path (shared ObsEncoder -> optional prev-action -> optional context via FiLM/concat -> heads)
@@ -317,6 +320,9 @@ class ActorCriticAug(ActorCritic):
             z = torch.cat([z, c], dim=-1)
         return z
 
+    def set_ctx_scale(self, s: float):
+        self._ctx_scale = float(s)
+
     def get_actor_obs_raw(self, obs):
         base = super().get_actor_obs(obs) # get base obs
         return base
@@ -355,140 +361,3 @@ class ActorCriticAug(ActorCritic):
 
     def set_prev_action(self, a_prev: Optional[torch.Tensor]):
         self._prev_action = a_prev
-
-    def _ensure_built(self, obs_actor: torch.Tensor):
-        return
-
-
-# # --- policy with shared encoder & belief injection ---
-# class BYOLActorCritic(ActorCritic):
-#     """
-#     ActorCritic with:
-#       - shared ObsEncoder feeding both heads
-#       - optional previous-action additive features
-#       - optional context 'c_t' via FiLM (concat avoided to keep head dims stable)
-#     The BYOL GRU/belief is not here — the algorithm calls .set_belief(c_t) each step.
-#     """
-#     def __init__(self, *base_args,
-#                  use_prev_action: bool = False,
-#                  ctx_mode: str = "film",      # 'none'|'concat'|'film'
-#                  ctx_dim: int = 0,
-#                  **kwargs):
-#         # Forward all base args/kwargs to ActorCritic to match RSL-RL API exactly
-#         super().__init__(*base_args, **kwargs)
-
-#         # policy-side options
-#         self.use_prev_action = bool(use_prev_action)
-#         # NOTE: 'concat' silently mapped to 'film' before; keep that for now but make it explicit.
-#         self.ctx_mode = "film" if str(ctx_mode) == "concat" else str(ctx_mode)
-#         self.ctx_dim = int(ctx_dim)
-#         # components are built lazily once we know actor input dim
-#         self._obs_dim: Optional[int] = None
-#         self.encoder: Optional[nn.Module] = None
-#         self.aenc: Optional[nn.Module] = None
-#         self.film: Optional[nn.Module] = None
-#         # slot for external belief c_t (set by algorithm each step)
-#         self._ctx: Optional[torch.Tensor] = None
-#         self._prev_action: Optional[torch.Tensor] = None
-
-#     def _infer_actor_input_dim(self) -> int:
-#         if hasattr(self, "actor_mlp"):
-#             for m in self.actor_mlp.modules():
-#                 if isinstance(m, nn.Linear):
-#                     return int(m.in_features)
-#         raise RuntimeError("Could not infer actor input dim from model; ensure obs tensor is provided.")
-
-#     def _ensure_built(self, obs_actor: torch.Tensor):
-#         if self.encoder is not None:
-#             return
-#         obs_dim = int(obs_actor.shape[-1]) if hasattr(obs_actor, 'shape') else None
-#         if obs_dim is None:
-#             obs_dim = self._infer_actor_input_dim()
-#         self._obs_dim = obs_dim
-#         # Keep output dim equal to actor input dim to preserve head shapes
-#         self.encoder = ObsEncoder(obs_dim, feat_dim=obs_dim)
-#         # pick device from obs or any parameter in the base model
-#         if hasattr(obs_actor, "device"):
-#             dev = obs_actor.device
-#         else:
-#             try:
-#                 dev = next(self.parameters()).device
-#             except Exception:
-#                 dev = torch.device("cpu")
-#         self.encoder.to(dev)
-#         if self.use_prev_action:
-#             # infer action dimension from base attribute if available
-#             act_dim = None
-#             if hasattr(self, "num_actions"):
-#                 try:
-#                     act_dim = int(getattr(self, "num_actions"))
-#                 except Exception:
-#                     act_dim = None
-#             if act_dim is None and hasattr(self, "actor_mlp"):
-#                 for m in self.actor_mlp.modules():
-#                     if isinstance(m, nn.Linear):
-#                         act_dim = int(m.out_features)
-#             if act_dim is None:
-#                 raise RuntimeError("Could not infer action dimension; set use_prev_action=False or expose num_actions.")
-#             self.aenc = ActionEncoder(act_dim, feat_dim=obs_dim)
-#             self.aenc.to(dev)
-#         if self.ctx_mode == "film" and self.ctx_dim > 0:
-#             self.film = FiLM(self.ctx_dim, feat_dim=obs_dim)
-#             self.film.to(dev)
-
-#     # called by algorithm each step (before act)
-#     def set_belief(self, c_t: Optional[torch.Tensor]): self._ctx = c_t
-#     def set_prev_action(self, a_prev: Optional[torch.Tensor]): self._prev_action = a_prev
-
-#     # feature path shared by actor & critic
-#     def _features(self, obs_actor: torch.Tensor):
-#         """Return BYOL-conditioned features from normalized actor observations.
-
-#         Computes the backbone encoder under no_grad (trained by BYOL), and
-#         applies FiLM (trained by PPO). Handles batch-size/device alignment
-#         between rollout-time (N) and update-time (B) shapes gracefully.
-#         """
-#         self._ensure_built(obs_actor)
-#         # 1) Encoder is frozen for PPO gradients:
-#         with torch.no_grad():
-#             z = self.encoder(obs_actor)
-#         # 2) Prev-action conditioning MUST remain learnable by PPO:
-#         if self.use_prev_action and (self._prev_action is not None):
-#             pa = self._prev_action
-#             try:
-#                 pa = pa.to(z.device)
-#             except Exception:
-#                 pass
-#             if pa.shape[0] == z.shape[0]:
-#                 z = z + self.aenc(pa)
-#             elif pa.shape[0] == 1:
-#                 z = z + self.aenc(pa.expand(z.shape[0], -1))
-#             else:
-#                 pass
-#         if self.film is not None and (self._ctx is not None):
-#             c = self._ctx
-#             try:
-#                 c = c.to(z.device)
-#             except Exception:
-#                 pass
-#             if c.shape[0] == z.shape[0]:
-#                 z = self.film(z, c)
-#             elif c.shape[0] == 1:
-#                 z = self.film(z, c.expand(z.shape[0], -1))
-#             else:
-#                 # shape mismatch during minibatch evaluation: skip FiLM
-#                 pass
-#         return z
-
-#     # Integrate BYOL features by overriding observation extraction hooks
-#     def get_actor_obs(self, obs):
-#         """Return actor observations passed through BYOL features."""
-#         base_obs = ActorCritic.get_actor_obs(self, obs)
-#         return self._features(base_obs)
-
-#     def get_critic_obs(self, obs):
-#         if hasattr(ActorCritic, "get_critic_obs"):
-#             base_obs = ActorCritic.get_critic_obs(self, obs)
-#         else:
-#             base_obs = ActorCritic.get_actor_obs(self, obs)
-#         return self._features(base_obs)

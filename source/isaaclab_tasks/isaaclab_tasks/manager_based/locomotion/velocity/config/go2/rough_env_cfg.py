@@ -23,41 +23,44 @@ class UnitreeGo2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.scene.robot = UNITREE_GO2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
         self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/base"
         # scale down the terrains because the robot is small
-        self.scene.terrain.terrain_generator.sub_terrains["boxes"].grid_height_range = (0.05, 0.2) # default (0.025, 0.1)
-        self.scene.terrain.terrain_generator.sub_terrains["random_rough"].noise_range = (0.04, 0.08) # default (0.01, 0.06)
-        self.scene.terrain.terrain_generator.sub_terrains["random_rough"].noise_step = 0.05 # default 0.01
+        self.scene.terrain.terrain_generator.sub_terrains["boxes"].grid_height_range = (0.025, 0.1) # default (0.025, 0.1)
+        self.scene.terrain.terrain_generator.sub_terrains["random_rough"].noise_range = (0.01, 0.06) # default (0.01, 0.06)
+        self.scene.terrain.terrain_generator.sub_terrains["random_rough"].noise_step = 0.01 # default 0.01
 
         # """ New: change physics"""
         # self.scene.terrain.physics_material.friction_combine_mode = "multiply" #default
         # self.scene.terrain.physics_material.static_friction = 0.8 #default 1.0
         # self.scene.terrain.physics_material.dynamic_friction = 0.6 #default 1.0
 
-        """ Turn off "privileged" observations """
+        # """ turn off curriculum """
+        # self.curriculum.terrain_levels = None
+
+        """ Turn on/off "privileged" observations """
         self.observations.policy.height_scan = None
         self.actions.joint_pos.scale = 0.25 # This is default. 
 
         """ Events: all happen at reset time """
         # randomize the base mass of the robot
         self.events.add_base_mass.mode = "reset" #default "startup"
-        self.events.add_base_mass.params["mass_distribution_params"] = (0.2, 3.0) #default (-1.0, 3.0)
-        self.events.add_base_mass.params["operation"] = "scale" #default "add"
+        self.events.add_base_mass.params["mass_distribution_params"] = (-2.0, 2.0) #default (-2.0, 2.0)
+        self.events.add_base_mass.params["operation"] = "add" #default "add"
         self.events.add_base_mass.params["distribution"] = "uniform" #default "uniform"
         self.events.add_base_mass.params["asset_cfg"].body_names = "base"
 
         # randomize friction of the terrain
         self.events.physics_material.mode = "reset" #default "startup"
-        self.events.physics_material.params["static_friction_range"] = (0.4, 1.2) #default (0.8, 0.8)
-        self.events.physics_material.params["dynamic_friction_range"] = (0.2, 1.0) #default (0.6, 0.6)
+        self.events.physics_material.params["static_friction_range"] = (0.8, 0.8) #default (0.8, 0.8)
+        self.events.physics_material.params["dynamic_friction_range"] = (0.6, 0.6) #default (0.6, 0.6)
         self.events.physics_material.params["num_buckets"] = 64 #default 64
         self.events.physics_material.params["asset_cfg"].body_names = ".*_foot" # only randomize feet friction
 
         # randomize CoM of the base
-        self.events.base_com.mode = "reset" #default "startup"
+        self.events.base_com.mode = "startup" #default "startup"
 
         # push the robot randomly
         self.events.base_external_force_torque.mode = "reset"
-        self.events.base_external_force_torque.params["force_range"] = (1.0, 5.0) #default (0.0, 0.0)
-        self.events.base_external_force_torque.params["torque_range"] = (-0.0, 0.0)
+        self.events.base_external_force_torque.params["force_range"] = (0.0, 0.0) #default (0.0, 0.0)
+        self.events.base_external_force_torque.params["torque_range"] = (0.0, 0.0)
 
         # reset robot 
         self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)

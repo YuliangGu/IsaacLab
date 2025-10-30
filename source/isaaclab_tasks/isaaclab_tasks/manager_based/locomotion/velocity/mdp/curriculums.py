@@ -51,25 +51,7 @@ def terrain_levels_vel(
     move_down *= ~move_up
     # update terrain levels
 
-    """ MODIFIED: randomly assign terrain levels (int) within valid range and update origins. """
-    max_level = 5
-    low_level = 0
-
-    cur = terrain.terrain_levels[env_ids]
-    new_levels = torch.randint(
-        low=low_level,
-        high=max_level,
-        size=cur.shape,
-        device=terrain.terrain_levels.device,
-        dtype=terrain.terrain_levels.dtype,
-    )
-    terrain.terrain_levels[env_ids] = new_levels
-    terrain.env_origins[env_ids] = terrain.terrain_origins[
-        terrain.terrain_levels[env_ids], terrain.terrain_types[env_ids]
-    ]
-
-    # alternatively, to use distance-based curriculum:
-    # terrain.update_env_origins(env_ids, move_up, move_down)
+    terrain.update_env_origins(env_ids, move_up, move_down)
     return torch.mean(terrain.terrain_levels.float())
 
 

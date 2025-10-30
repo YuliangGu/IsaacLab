@@ -9,11 +9,11 @@ plus a runner that wires everything together.
 
 ## Features
 
-- Temporal BYOL over windowed observation (and optional action) sequences
-- Optional encoder sharing between PPO and BYOL (toggleable)
-- Context/belief injection into the policy (optional:critic) via FiLM or concat
-- Lightweight diagnostics: BYOL mismatch, etc.
-- BYOL-driven curriculum suggestion (EMA-based) in the runner (optional)
+- Temporal BYOL over windowed observation sequences with optional action conditioning and GRU aggregators (`last`/`mean`/`attn`)
+- Shared or dedicated encoders for policy vs. BYOL plus per-group LR multipliers for the optimizer
+- Context/belief injection into the policy (and optional critic) via FiLM or concat, with previous-action features
+- Rich augmentation suite: jitter, time-warp, feature/frame/channel drop, mix, smooth, and mask augmentations
+- Runtime diagnostics (BYOL mismatch, EMA) and optional BYOL-driven curriculum suggestions in the runner
 
 ## Install
 
@@ -43,14 +43,13 @@ isaaclab.bat -p scripts\reinforcement_learning\rsl_rl\train_byol.py --task  Isaa
 
 ### Key algorithm knobs (agent.algorithm)
 
-- `enable_byol` (bool): turn BYOL loss on/off
-- `share_byol_encoder` (bool): share obs encoder between PPO and BYOL
-- `byol_lambda` (float): BYOL loss weight
-- `byol_window` (int): sequence window length
-- `byol_batch` (int): BYOL batch size per update
-- `byol_tau_start` / `byol_tau_end` (float): EMA momentum range for target nets
-- `byol_z_dim` (int): latent/context dim (must match policy.ctx_dim)
+- `enable_byol` / `share_byol_encoder`: toggle BYOL and whether it reuses the policy encoder
+- `byol_lambda`, `byol_window`, `byol_batch`, `byol_tau_start`/`byol_tau_end`, `byol_z_dim`, `byol_proj_dim`: core loss and architecture settings
+- `byol_use_actions`: include previous-action sequences via an auxiliary encoder
+- `byol_ctx_agg`: select GRU aggregation for the BYOL context (`last`, `mean`, `attn`)
 - Augmentations: `byol_noise_std`, `byol_time_warp_scale`, `byol_feat_drop`, `byol_frame_drop`, `byol_max_shift`
+- Extra augmentations: `byol_ch_drop`, `byol_time_mask_prob`/`byol_time_mask_span`, `byol_gain_std`, `byol_bias_std`, `byol_smooth_prob`/`byol_smooth_kernel`, `byol_mix_strength`
+- Optimizer multipliers (forwarded via PPO kwargs): `lr_mult_encoder`, `lr_mult_byol`
 
 ### Policy knobs (agent.policy)
 
@@ -72,4 +71,3 @@ The algorithm logs additional metrics when BYOL is enabled:
 
 ## License
 This package follows the Isaac Lab project licensing.
-
