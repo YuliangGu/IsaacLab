@@ -80,15 +80,26 @@ class SeqEncoder(nn.Module):
         self.action_encoder = action_encoder
         self.gru = nn.GRU(input_size=self.obs_encoder.out_dim,
                           hidden_size=z_dim,
+                          num_layers=1,
+                          dropout=0.1,
+                          bidirectional=False,
                           batch_first=True)
 
     def _encode_frames(self, obs_seq: torch.Tensor, act_seq: Optional[torch.Tensor]) -> torch.Tensor:
         B, W, D = obs_seq.shape
-        feats = self.obs_encoder(obs_seq.reshape(B * W, D)).reshape(B, W, -1)  # [B,W,F]
-        if act_seq is not None and self.action_encoder is not None:
-            A = act_seq.shape[-1]
-            actf = self.action_encoder(act_seq.reshape(B * W, A)).reshape(B, W, -1)
-            feats = feats + actf  # same feature space, simple additive fusion
+        # Ensure inputs are normal (non-inference) tensors so GRU can save
+        # them for backward. Use a clone outside inference_mode to
+        # re-materialize fresh tensors for Autograd.
+        with torch.inference_mode(False):
+            x_view = obs_seq.reshape(B * W, D)
+            x = x_view.clone()  # normal tensor for autograd
+            feats = self.obs_encoder(x).reshape(B, W, -1)  # [B,W,F]
+            if act_seq is not None and self.action_encoder is not None:
+                A = act_seq.shape[-1]
+                a_view = act_seq.reshape(B * W, A)
+                a = a_view.clone()  # normal tensor for autograd
+                actf = self.action_encoder(a).reshape(B, W, -1)
+                feats = feats + actf  # same feature space, simple additive fusion
         return feats
 
     def forward(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
@@ -97,6 +108,8 @@ class SeqEncoder(nn.Module):
         else:
             obs_seq, act_seq = x, None
         feats = self._encode_frames(obs_seq, act_seq)       # [B,W,F]
+        # Clone to make sure GRU sees a normal tensor for saved tensors
+        feats = feats.clone()
         _, hT = self.gru(feats)                             # hT: [1,B,z]
         return hT.squeeze(0)                                # [B,z]
     
@@ -188,6 +201,7 @@ class BYOLSeq(nn.Module):
         p2 = self.g_online(z2)
         h1 = self.q_online(p1)          # [B, p]
         h2 = self.q_online(p2)
+        
         # Targets (no grad)
         with torch.no_grad():
             z1t = self.f_targ(v1)
@@ -213,20 +227,16 @@ class BYOLSeq(nn.Module):
         m21 = (l2norm(h2) - l2norm(p1t)).pow(2).sum(-1)
         return 0.5 * (m12 + m21)
 
-    def online_parameters(self, include_obs_encoder: bool) -> List[nn.Parameter]:
-        """
-        Expose trainable params for optimizer construction.
-        If you share obs_encoder with PPO: include_obs_encoder=False; otherwise True.
-        """
-        params: List[nn.Parameter] = (
+    def online_parameters(self, include_obs_encoder: bool, include_action_encoder: bool = False):
+        params = (
             list(self.f_online.gru.parameters())
             + list(self.g_online.parameters())
             + list(self.q_online.parameters())
         )
         if include_obs_encoder:
             params = list(self.f_online.obs_encoder.parameters()) + params
-            if self.f_online.action_encoder is not None:
-                params = list(self.f_online.action_encoder.parameters()) + params
+        if include_action_encoder and (self.f_online.action_encoder is not None):
+            params = list(self.f_online.action_encoder.parameters()) + params
         return params
 
 # class BYOLSeq(nn.Module):
