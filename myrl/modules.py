@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from typing import Optional
+import math
 
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
-from myrl.utils_core import ObsEncoder, ActionEncoder, FiLM
+from myrl.utils_core import ObsEncoder, FiLM
 
 """ This is the original RSL-RL ActorCritic (copied here for extension) """
 class ActorCritic(nn.Module):
@@ -175,24 +176,19 @@ class ActorCriticAug(ActorCritic):
     """
     Augmented ActorCritic with:
       - shared ObsEncoder feeding both heads
-      - optional previous-action additive features
       - optional context 'c_t' via FiLM or concat
     """
     def __init__(self, *base_args,
-                 use_prev_action: bool = False,
                  ctx_mode: str = "concat",      # 'none'|'concat'|'film'
                  ctx_dim: int = 0,
                  feat_dim: Optional[int] = 128,  # ObsEncoder output dim; defaults to obs dim
-                 ctx_to_critic: bool = False,
                  **kwargs):
         """Augmented ActorCritic compatible with rsl-rl.
 
         Args:
-            use_prev_action (bool): Whether to use previous action as input.
             ctx_mode (str): Context mode to use ('none', 'concat', 'film').
             ctx_dim (int): Dimension of the context vector.
             feat_dim (Optional[int]): Feature dimension for the encoder. If None, defaults to observation dimension.
-            ctx_to_critic (bool): Whether to also feed context to critic (default: False).
             actor_layer_norm (bool): use a tiny layer norm if it takes context input (default: False).
 
         Description:
@@ -208,27 +204,31 @@ class ActorCriticAug(ActorCritic):
         actor_hidden_dims = kwargs.get("actor_hidden_dims", [256, 256, 256])
         critic_hidden_dims = kwargs.get("critic_hidden_dims", [256, 256, 256])
         activation = kwargs.get("activation", "elu")
-
-        # Build base to populate dims, noise params, and group logic
+        init_noise_std = kwargs.get("init_noise_std", 1.0)
+        kwargs.pop("ctx_to_critic", None)
         super().__init__(*base_args, **kwargs)
 
+        if isinstance(init_noise_std, torch.Tensor):
+            init_noise_std = float(init_noise_std.detach().cpu().item())
+        else:
+            init_noise_std = float(init_noise_std)
+        self._init_noise_std = init_noise_std
+
         self._feat_dim = feat_dim
+
         # Shared encoder and optional conditioners
         out_dim = int(self._obs_dim if feat_dim is None else feat_dim)
         self.encoder = ObsEncoder(self._obs_dim, feat_dim=out_dim)
-        self.use_prev_action = bool(use_prev_action)
         self.ctx_mode = str(ctx_mode)
         self.ctx_dim = int(ctx_dim)
-        self.ctx_to_critic = bool(ctx_to_critic)
 
         # optional modules
-        self.aenc = ActionEncoder(self._act_dim, self.encoder.out_dim) if self.use_prev_action else None
         self.film = FiLM(self.ctx_dim, self.encoder.out_dim) if (self.ctx_mode == "film" and self.ctx_dim > 0) else None
 
         # compute head input dim 
         head_in = self.encoder.out_dim + (self.ctx_dim if (self.ctx_mode == "concat" and self.ctx_dim > 0) else 0)
 
-        # Rebuild actor/critic heads to consume shared features
+        # Overwrite actor and critic with new input dims
         self.actor = MLP(head_in, self._act_dim, actor_hidden_dims, activation)
         self.critic = MLP(head_in, 1, critic_hidden_dims, activation)
 
@@ -242,12 +242,8 @@ class ActorCriticAug(ActorCritic):
         else:
             self.critic_obs_normalizer = torch.nn.Identity()
 
-        # modulate context usage over time
-        self._ctx_scale = 0.0 # NOTE: this should be set by algorithm over time
-
         # Runtime inputs set by algorithm (optional)
         self._ctx: Optional[torch.Tensor] = None
-        self._prev_action: Optional[torch.Tensor] = None
 
         # print workflow diagram
         print("=================== PPO_BYOL WORKFLOW ====================")
@@ -258,11 +254,10 @@ class ActorCriticAug(ActorCritic):
         """Prints a diagram of the model architecture.
 
         Includes:
-        - Policy path (shared ObsEncoder -> optional prev-action -> optional context via FiLM/concat -> heads)
+        - Policy path (shared ObsEncoder -> optional context via FiLM/concat -> heads)
         - BYOL path (sequence encoder + GRU -> online/target projection; context c_t comes from algorithm)
         """
         obs_dim = getattr(self, "_obs_dim", None)
-        act_dim = getattr(self, "_act_dim", None)
         feat_dim = getattr(self.encoder, "out_dim", None) if hasattr(self, "encoder") else None
         ctx_dim = int(getattr(self, "ctx_dim", 0))
         head_in = feat_dim + (ctx_dim if (self.ctx_mode == "concat" and ctx_dim > 0) else 0)
@@ -280,9 +275,6 @@ class ActorCriticAug(ActorCritic):
         # Section: Policy path
         lines.append("POLICY PATH")
         lines.append(f"  x_t [N,{fmt_dim(obs_dim)}] --ObsEncoder--> z_t [N,{fmt_dim(feat_dim)}]")
-        if self.use_prev_action:
-            lines.append(f"  a_(t-1) [N,{fmt_dim(act_dim)}] --ActionEncoder--> e_a [N,{fmt_dim(feat_dim)}]")
-            lines.append("                                  + (add) --> z_t'")
         if self.ctx_mode == "film" and self.film is not None and ctx_dim > 0:
             lines.append(f"  c_t [N,{fmt_dim(ctx_dim)}] --FiLM(z_t, c_t)--> z*_t [N,{fmt_dim(feat_dim)}]")
             head_in_now = feat_dim
@@ -309,42 +301,33 @@ class ActorCriticAug(ActorCritic):
 
         print("\n".join(lines))
 
-    def _features(self, x: torch.Tensor, a_prev: torch.Tensor | None, c: torch.Tensor | None) -> torch.Tensor:
-        """ shared feature extractor with optional prev-action and context """
+    def _features(self, x: torch.Tensor, c: torch.Tensor | None) -> torch.Tensor:
+        """ shared feature extractor with optional context """
         z = self.encoder(x)  # [B,F]
-        if self.use_prev_action and a_prev is not None:
-            z = z + self.aenc(a_prev)  # additive into the same feature space
         if self.film is not None:
             z = self.film(z, c)
         if self.ctx_mode == "concat" and self.ctx_dim > 0 and c is not None:
             z = torch.cat([z, c], dim=-1)
         return z
 
-    def set_ctx_scale(self, s: float):
-        self._ctx_scale = float(s)
-
     def get_actor_obs_raw(self, obs):
-        base = super().get_actor_obs(obs) # get base obs
+        base = super().get_actor_obs(obs) 
         return base
 
     def get_critic_obs_raw(self, obs):
-        base = super().get_critic_obs(obs) # get base obs
+        base = super().get_critic_obs(obs)
         return base
 
     # --- rsl-rl observation hooks ---
     def get_actor_obs(self, obs):
         base = self.get_actor_obs_raw(obs)
-        a_prev = self._prev_action
         c = self._ctx
-        return self._features(base, a_prev, c)
+        return self._features(base, c)
 
     def get_critic_obs(self, obs):
         base = self.get_critic_obs_raw(obs)
-        a_prev = self._prev_action
         c = self._ctx
-        if not self.ctx_to_critic:
-            c = None
-        return self._features(base, a_prev, c)
+        return self._features(base, c)
 
     # --- normalization updates over features ---
     def update_normalization(self, obs):
@@ -360,4 +343,4 @@ class ActorCriticAug(ActorCritic):
         self._ctx = c_t
 
     def set_prev_action(self, a_prev: Optional[torch.Tensor]):
-        self._prev_action = a_prev
+        pass
