@@ -179,13 +179,17 @@ class ActorCriticAug(ActorCritic):
       - optional context 'c_t' via FiLM or concat
     """
     def __init__(self, *base_args,
+                 rpo_actor: bool = False,
+                 rpo_alpha: float = 0.5,
                  ctx_mode: str = "concat",      # 'none'|'concat'|'film'
-                 ctx_dim: int = 0,
+                 ctx_dim: int = 32,
                  feat_dim: Optional[int] = 128,  # ObsEncoder output dim; defaults to obs dim
                  **kwargs):
         """Augmented ActorCritic compatible with rsl-rl.
 
         Args:
+            rpo_actor (bool): Whether to apply RPO-style mean perturbations during sampling.
+            rpo_alpha (float): Magnitude of the uniform perturbation applied when `rpo_actor` is True.
             ctx_mode (str): Context mode to use ('none', 'concat', 'film').
             ctx_dim (int): Dimension of the context vector.
             feat_dim (Optional[int]): Feature dimension for the encoder. If None, defaults to observation dimension.
@@ -205,7 +209,6 @@ class ActorCriticAug(ActorCritic):
         critic_hidden_dims = kwargs.get("critic_hidden_dims", [256, 256, 256])
         activation = kwargs.get("activation", "elu")
         init_noise_std = kwargs.get("init_noise_std", 1.0)
-        kwargs.pop("ctx_to_critic", None)
         super().__init__(*base_args, **kwargs)
 
         if isinstance(init_noise_std, torch.Tensor):
@@ -213,6 +216,11 @@ class ActorCriticAug(ActorCritic):
         else:
             init_noise_std = float(init_noise_std)
         self._init_noise_std = init_noise_std
+
+        self.rpo_actor = bool(rpo_actor)
+        self.rpo_alpha = float(rpo_alpha)
+        if self.rpo_alpha < 0.0:
+            raise ValueError(f"rpo_alpha must be non-negative, got {self.rpo_alpha}.")
 
         self._feat_dim = feat_dim
 
@@ -249,6 +257,26 @@ class ActorCriticAug(ActorCritic):
         print("=================== PPO_BYOL WORKFLOW ====================")
         self._draw_model_diagram()
         print("========================================================")
+
+    def _actor_distribution_from_features(
+        self, features: torch.Tensor, apply_rpo: bool
+    ) -> Normal:
+        """Builds the action distribution from encoded features."""
+        mean = self.actor(features)
+        if self.noise_std_type == "scalar":
+            std = self.std.expand_as(mean)
+        elif self.noise_std_type == "log":
+            std = torch.exp(self.log_std).expand_as(mean)
+        else:
+            raise ValueError(
+                f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'"
+            )
+
+        if apply_rpo and self.rpo_actor and self.training:
+            noise = torch.empty_like(mean).uniform_(-self.rpo_alpha, self.rpo_alpha)
+            mean = mean + noise
+
+        return Normal(mean, std)
     
     def _draw_model_diagram(self):
         """Prints a diagram of the model architecture.
@@ -328,19 +356,31 @@ class ActorCriticAug(ActorCritic):
         base = self.get_critic_obs_raw(obs)
         c = self._ctx
         return self._features(base, c)
+    
+    def update_distribution(self, obs, apply_rpo: Optional[bool] = None):
+        """Update action distribution using encoded (and normalized) observations."""
+        if apply_rpo is None:
+            apply_rpo = self.rpo_actor
+        dist = self._actor_distribution_from_features(obs, apply_rpo)
+        self.distribution = dist
+        return dist
 
-    # --- normalization updates over features ---
+    def act(self, obs, **kwargs):
+        obs = self.get_actor_obs(obs)
+        obs = self.actor_obs_normalizer(obs)
+        self.update_distribution(obs)
+        return self.distribution.sample()
+
+    # --- normalization updates (only on raw obs) ---
     def update_normalization(self, obs):
         if self.actor_obs_normalization:
-            z_a = self.get_actor_obs(obs)
+            z_a = self.get_actor_obs_raw(obs)
             self.actor_obs_normalizer.update(z_a)
         if self.critic_obs_normalization:
-            z_c = self.get_critic_obs(obs)
+            z_c = self.get_critic_obs_raw(obs)
             self.critic_obs_normalizer.update(z_c)
 
     # --- rollout-time hooks used by PPOWithBYOL ---
     def set_belief(self, c_t: Optional[torch.Tensor]):
         self._ctx = c_t
 
-    def set_prev_action(self, a_prev: Optional[torch.Tensor]):
-        pass

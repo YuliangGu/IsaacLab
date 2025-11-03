@@ -23,7 +23,7 @@ _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
-from myrl.utils_core import sample_byol_windows, BYOLSeq, ObsEncoder, ActionEncoder
+from myrl.utils_core import sample_byol_windows, BYOLSeq, ObsEncoder
 
 
 def _load_tensor(data: dict, key: str, *, dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -73,29 +73,19 @@ def main() -> None:
 
     obs = _load_tensor(data, "observations", dtype=torch.float32)
     dones = _load_tensor(data, "dones").to(dtype=torch.bool)
-    actions = data.get("actions")
-    if actions is not None:
-        actions = actions.to(torch.float32)
-
     device = torch.device(args.device)
 
     obs_encoder = ObsEncoder(obs_dim=obs.shape[-1], feat_dim=256).to(device=device)
-    action_encoder = None
-    if actions is not None:
-        action_encoder = ActionEncoder(act_dim=actions.shape[-1], feat_dim=256).to(device=device)
 
     model = BYOLSeq(
         obs_encoder=obs_encoder,
-        action_encoder=action_encoder,
         z_dim=128,
         proj_dim=128,
         tau=0.99,
         use_information_bottleneck=True,
     ).to(device=device)
     optimizer = torch.optim.AdamW(
-        model.online_parameters(
-            include_obs_encoder=True, include_action_encoder=actions is not None
-        ),
+        model.online_parameters(include_obs_encoder=True),
         lr=3e-4,
         weight_decay=1e-4,
     )
@@ -114,14 +104,8 @@ def main() -> None:
             frame_drop=args.frame_drop,
             time_warp_scale=args.time_warp,
             device=device,
-            actions=actions,
         )
-        if actions is None:
-            v1, v2, _, _ = windows
-        else:
-            (v1o, v1a), (v2o, v2a), _, _ = windows
-            v1 = (v1o, v1a)
-            v2 = (v2o, v2a)
+        v1, v2, _, _ = windows
         loss = model.loss(v1, v2)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -155,17 +139,6 @@ def main() -> None:
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
     print(f"[BYOL] saved PCA scatter to {out_path}")
-
-    # if actions is None:
-    #     v1, v2, picks, count = windows
-    #     print(f"obs view1 shape = {tuple(v1.shape)}, view2 shape = {tuple(v2.shape)}")
-    # else:
-    #     (v1o, v1a), (v2o, v2a), picks, count = windows
-    #     print(f"obs view1 shape = {tuple(v1o.shape)}, actions view1 shape = {tuple(v1a.shape)}")
-    #     print(f"obs view2 shape = {tuple(v2o.shape)}, actions view2 shape = {tuple(v2a.shape)}")
-
-    # print(f"sampled windows = {count}, unique picks = {len(picks)}")
-    # print("first 5 picks:", picks[:5])
 
 
 if __name__ == "__main__":

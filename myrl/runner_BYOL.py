@@ -19,7 +19,6 @@ from myrl.modules import ActorCriticAug
 
 
 """ This is the OnPolicyRunner code from rsl-rl, copied here support PPO with BYOL auxiliary loss."""
-
 class OnPolicyRunner:
     """On-policy runner for training and evaluation of actor-critic methods."""
 
@@ -59,7 +58,7 @@ class OnPolicyRunner:
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
-    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
+    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False): 
         # initialize writer
         self._prepare_logging_writer()
 

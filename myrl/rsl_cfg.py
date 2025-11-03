@@ -21,11 +21,11 @@ class PPObyolRunnerCfg(RslRlOnPolicyRunnerCfg):
         # default ActorCritic hparams
 
         # BYOL extras
-        use_prev_action: bool = False
+        rpo_actor: bool = False
+        rpo_alpha: float = 0.5
         ctx_mode: str = "concat"  # 'film'|'concat'|'none'
         ctx_dim: int = 128          # Must match algorithm.byol_z_dim
-        feat_dim: int = 256        # ObsEncoder output dim
-        ctx_to_critic: bool = True  # Whether to also feed context to critic
+        feat_dim: int = 128        # ObsEncoder output dim
 
     @configclass
     class algorithm(RslRlPpoAlgorithmCfg):
@@ -40,22 +40,15 @@ class PPObyolRunnerCfg(RslRlOnPolicyRunnerCfg):
         byol_tau_start: float = 0.98
         byol_tau_end: float = 0.998
         byol_z_dim: int = 128   # Must match policy.ctx_dim
-        byol_proj_dim: int = 256
-        byol_max_shift: int = 1
-        byol_noise_std: float = 0.02
-        byol_time_warp_scale: float = 0.0  # NOTE: this operation can be slow
-        byol_feat_drop: float = 0.05
-        byol_frame_drop: float = 0.05
-        byol_use_actions: bool = True
+        byol_proj_dim: int = 128
+        byol_update_proportion: float = 0.5
+
+        # BYOL augmentations
+        byol_delay: int = 2
+        byol_gaussian_jitter_std: float = 0.02
+        byol_causal_padding_proportion: float = 0.1
+        byol_frame_drop: float = 0.1
+
         # Aggregator for BYOL context: 'last' | 'mean' | 'attn'
         byol_ctx_agg: str = "attn"
 
-        # Extra augmentations (all optional; default disabled)
-        byol_ch_drop: float = 0.1
-        byol_time_mask_prob: float = 0.0
-        byol_time_mask_span: int = 0
-        byol_gain_std: float = 0.0
-        byol_bias_std: float = 0.0
-        byol_smooth_prob: float = 0.0
-        byol_smooth_kernel: int = 0
-        byol_mix_strength: float = 0.0

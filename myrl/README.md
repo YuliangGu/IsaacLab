@@ -11,7 +11,7 @@ plus a runner that wires everything together.
 
 - Temporal BYOL over windowed observation sequences with optional action conditioning and GRU aggregators (`last`/`mean`/`attn`)
 - Shared or dedicated encoders for policy vs. BYOL plus per-group LR multipliers for the optimizer
-- Context/belief injection into the policy (and optional critic) via FiLM or concat, with previous-action features
+- Context/belief injection into both policy and critic via FiLM or concat, with previous-action features
 - Rich augmentation suite: jitter, time-warp, feature/frame/channel drop, mix, smooth, and mask augmentations
 - Runtime diagnostics (BYOL mismatch, EMA) and optional BYOL-driven curriculum suggestions in the runner
 
@@ -45,7 +45,6 @@ isaaclab.bat -p scripts\reinforcement_learning\rsl_rl\train_byol.py --task  Isaa
 
 - `enable_byol` / `share_byol_encoder`: toggle BYOL and whether it reuses the policy encoder
 - `byol_lambda`, `byol_window`, `byol_batch`, `byol_tau_start`/`byol_tau_end`, `byol_z_dim`, `byol_proj_dim`: core loss and architecture settings
-- `byol_use_actions`: include previous-action sequences via an auxiliary encoder
 - `byol_ctx_agg`: select GRU aggregation for the BYOL context (`last`, `mean`, `attn`)
 - Augmentations: `byol_noise_std`, `byol_time_warp_scale`, `byol_feat_drop`, `byol_frame_drop`, `byol_max_shift`
 - Extra augmentations: `byol_ch_drop`, `byol_time_mask_prob`/`byol_time_mask_span`, `byol_gain_std`, `byol_bias_std`, `byol_smooth_prob`/`byol_smooth_kernel`, `byol_mix_strength`
@@ -58,7 +57,6 @@ isaaclab.bat -p scripts\reinforcement_learning\rsl_rl\train_byol.py --task  Isaa
 - `ctx_dim`: match `byol_z_dim`
 - `feat_dim`: encoder output dim
 - `use_prev_action`: include previous action via an action encoder
-- `ctx_to_critic`: inject context to critic
 
 ## Diagnostics
 

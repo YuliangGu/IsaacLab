@@ -1,20 +1,18 @@
 import math
 import torch, torch.nn as nn, numpy as np
 import torch.nn.functional as F
-from typing import Optional, Tuple, Union, List
+from typing import Optional, Tuple, List, Union
+from dataclasses import dataclass
 
 def l2norm(x: torch.Tensor) -> torch.Tensor:
-    """Row-wise L2-normalization."""
     return F.normalize(x, dim=-1)
 
 def layer_init(layer: nn.Linear, std: float = math.sqrt(2.0), bias_const: float = 0.0) -> nn.Linear:
-    """Orthogonal initialization for linear layers."""
     nn.init.orthogonal_(layer.weight, std)
     nn.init.constant_(layer.bias, bias_const)
     return layer
 
 def mlp(in_dim: int, out_dim: int) -> nn.Sequential:
-    """Light MLP head (used in BYOL)."""
     return nn.Sequential(
         nn.Linear(in_dim, 256),
         # nn.BatchNorm1d(512), # BatchNorm for heterogeneous data
@@ -24,33 +22,20 @@ def mlp(in_dim: int, out_dim: int) -> nn.Sequential:
     )
 
 class ObsEncoder(nn.Module):
-    """Small network to map observations to feature space."""
     def __init__(self, obs_dim: int, feat_dim: int = 64):
         super().__init__()
         self.net = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, feat_dim))
+            layer_init(nn.Linear(obs_dim, feat_dim)),
+            nn.ReLU(inplace=True),
         ) #Just a single linear layer
         self.out_dim = feat_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-class ActionEncoder(nn.Module):
-    """Simple network to map actions to feature space."""
-    def __init__(self, act_dim: int, feat_dim: int = 64):
-        super().__init__()
-        self.net = nn.Sequential(
-            layer_init(nn.Linear(act_dim, feat_dim))
-        ) #Just a single linear layer
-        self.out_dim = feat_dim
-
-    def forward(self, a: torch.Tensor) -> torch.Tensor:
-        return self.net(a)
-
 class FiLM(nn.Module):
     """
-    Feature-wise Linear Modulation: z' = (1 + gamma(c)) ⊙ z + beta(c).
-    Stable, simple conditioning for belief/context vectors. See: https://arxiv.org/abs/1709.07871
+    Feature-wise Linear Modulation (FiLM) layer. See: https://arxiv.org/abs/1709.07871
     """
     def __init__(self, ctx_dim: int, feat_dim: int):
         super().__init__()
@@ -65,17 +50,14 @@ class FiLM(nn.Module):
 
 class SeqEncoder(nn.Module):
     """
-    Sequence encoder: (ObsEncoder [ + ActionEncoder ]) -> GRU -> z_T
-    Accepts input as either:
+    Sequence encoder: ObsEncoder -> GRU -> z_T
+    Accepts input as:
         - obs_seq:  Tensor[B, W, D_obs]
-        - (obs_seq, act_seq): Tuple[Tensor[B,W,D_obs], Tensor[B,W,D_act]]
     Returns: Tensor[B, z_dim]
     """
-    def __init__(self, obs_encoder: ObsEncoder, z_dim: int, action_encoder: Optional[ActionEncoder] = None,
-                 output_type: str = "last"):
+    def __init__(self, obs_encoder: ObsEncoder, z_dim: int, output_type: str = "last"):
         super().__init__()
         self.obs_encoder = obs_encoder
-        self.action_encoder = action_encoder
         self.gru = nn.GRU(input_size=self.obs_encoder.out_dim,
                           hidden_size=z_dim,
                           batch_first=True)
@@ -83,21 +65,13 @@ class SeqEncoder(nn.Module):
         if self.output_type == "attn":
             self.attn = nn.Linear(z_dim, 1)
 
-    def _encode_frames(self, obs_seq: torch.Tensor, act_seq: Optional[torch.Tensor]) -> torch.Tensor:
+    def _encode_frames(self, obs_seq: torch.Tensor) -> torch.Tensor:
         B, W, D = obs_seq.shape # batch, window, obs_dim
         feats = self.obs_encoder(obs_seq.reshape(B * W, D)).reshape(B, W, -1)  # [B,W,F]
-        if act_seq is not None and self.action_encoder is not None:
-            A = act_seq.shape[-1]
-            actf = self.action_encoder(act_seq.reshape(B * W, A)).reshape(B, W, -1)
-            feats = feats + actf  # same feature space, simple additive fusion
         return feats
 
-    def forward(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
-        if isinstance(x, tuple):
-            obs_seq, act_seq = x
-        else:
-            obs_seq, act_seq = x, None
-        feats = self._encode_frames(obs_seq, act_seq)       # [B,W,F]: batch, window, feat_dim
+    def forward(self, obs_seq: torch.Tensor) -> torch.Tensor:
+        feats = self._encode_frames(obs_seq)       # [B,W,F]: batch, window, feat_dim
         out, hT = self.gru(feats)  # out: [B,W,z], hT: [1,B,z]
         if self.output_type == "last":
             return hT.squeeze(0)    # [B,z]
@@ -111,20 +85,33 @@ class SeqEncoder(nn.Module):
 
 class BYOLSeq(nn.Module):
     """
-    Temporal BYOL on vector sequences with optional action conditioning.
+    BYOL for sequential data (BYOL-Seq).
 
-    Original BYOL paper: https://arxiv.org/abs/2006.07733
+    Args:
+        obs_encoder: ObsEncoder module to encode individual observations
+        z_dim:       Dimension of sequence representation
+        proj_dim:    Dimension of projection head output
+        tau:         EMA coefficient for target networks
+        output_type: How to pool GRU outputs ('last', 'mean', 'attn')
+        use_information_bottleneck: Whether to apply an information bottleneck on z
+
+    Notes:
+        output_type:
+            'last' - use final hidden state h_T
+            'mean' - average over all hidden states
+            'attn' - learnable attention over hidden states
+        use_information_bottleneck:
+            If True, applies an information bottleneck on the sequence representation z. Use re-parameterization trick.
     """
     def __init__(self,
                  obs_encoder: ObsEncoder,
                  z_dim: int = 128,
                  proj_dim: int = 128,
                  tau: float = 0.996,
-                 action_encoder: Optional[ActionEncoder] = None,
                  output_type: str = "last",
                  use_information_bottleneck: bool = False):
         super().__init__()
-        self.f_online = SeqEncoder(obs_encoder, z_dim=z_dim, action_encoder=action_encoder, output_type=output_type)
+        self.f_online = SeqEncoder(obs_encoder, z_dim=z_dim, output_type=output_type)
         self.g_online = mlp(z_dim, proj_dim)
         self.q_online = mlp(proj_dim, proj_dim)
         self.use_information_bottleneck = bool(use_information_bottleneck)
@@ -154,6 +141,14 @@ class BYOLSeq(nn.Module):
         self.f_targ.eval()
         self.g_targ.eval()
         return self
+
+    def infer_ctx(self,
+                  obs_seq: torch.Tensor) -> torch.Tensor:
+        """Encode context from observation sequence. obs_seq: [B,W,D_obs] -> [B,z_dim]"""
+        z = self.f_online(obs_seq)
+        if self.use_information_bottleneck:
+            z, _ = self._apply_information_bottleneck(z, sample=True)
+        return z
     
     @torch.no_grad()
     def ema_update(self) -> None:
@@ -163,8 +158,8 @@ class BYOLSeq(nn.Module):
                 p_t.data.mul_(self.tau).add_(p_o.data, alpha=1.0 - self.tau)
 
     def _forward_pair(self,
-                      v1: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-                      v2: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]):
+                      v1: torch.Tensor,
+                      v2: torch.Tensor):
         # Online
         z1 = self.f_online(v1)          # [B, z]
         z2 = self.f_online(v2)
@@ -184,7 +179,7 @@ class BYOLSeq(nn.Module):
             z1t = self.f_targ(v1)
             z2t = self.f_targ(v2)
             if self.use_information_bottleneck:
-                z1t, _ = self._apply_information_bottleneck(z1t, sample=False)
+                z1t, _ = self._apply_information_bottleneck(z1t, sample=False) # targets use mean
                 z2t, _ = self._apply_information_bottleneck(z2t, sample=False)
             p1t = self.g_targ(z1t)
             p2t = self.g_targ(z2t)
@@ -206,8 +201,8 @@ class BYOLSeq(nn.Module):
         return z_sample, kl
 
     def loss(self,
-             v1: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-             v2: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
+             v1: torch.Tensor,
+             v2: torch.Tensor) -> torch.Tensor:
         h1, h2, p1t, p2t = self._forward_pair(v1, v2)
         loss_12 = (l2norm(h1) - l2norm(p2t)).pow(2).sum(-1).mean()
         loss_21 = (l2norm(h2) - l2norm(p1t)).pow(2).sum(-1).mean()
@@ -218,14 +213,14 @@ class BYOLSeq(nn.Module):
 
     @torch.no_grad()
     def mismatch_per_window(self,
-                            v1: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-                            v2: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
+                            v1: torch.Tensor,
+                            v2: torch.Tensor) -> torch.Tensor:
         h1, h2, p1t, p2t = self._forward_pair(v1, v2)
         m12 = (l2norm(h1) - l2norm(p2t)).pow(2).sum(-1)
         m21 = (l2norm(h2) - l2norm(p1t)).pow(2).sum(-1)
         return 0.5 * (m12 + m21)
 
-    def online_parameters(self, include_obs_encoder: bool, include_action_encoder: bool = False):
+    def online_parameters(self, include_obs_encoder: bool):
         params = (
             list(self.f_online.gru.parameters())
             + list(self.g_online.parameters())
@@ -235,8 +230,6 @@ class BYOLSeq(nn.Module):
             params = list(self.ib_head.parameters()) + params
         if include_obs_encoder:
             params = list(self.f_online.obs_encoder.parameters()) + params
-        if include_action_encoder and (self.f_online.action_encoder is not None):
-            params = list(self.f_online.action_encoder.parameters()) + params
         return params
 
 @torch.no_grad()
@@ -306,12 +299,103 @@ def extract_policy_obs_and_dones(storage) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 # ========================= Augmentations & Sampling =======================
+Index = Union[slice, List[int]]
 
-def _randn_like_gen(x: torch.Tensor, rng: torch.Generator) -> torch.Tensor:
-    try:
-        return torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=rng)
-    except TypeError:
-        return torch.randn(x.shape, device=x.device, dtype=x.dtype)
+@dataclass
+class ObsGroup:
+    """Index map for [B, W, D_obs] observation tensor. This is for QuadrupedEnv obs structure."""
+    base_lin_vel: Optional[Index] = None
+    base_ang_vel: Optional[Index] = None
+    proj_gravity: Optional[Index] = None
+    cmd_vel: Optional[Index] = None
+    joint_pos: Optional[Index] = None
+    joint_vel: Optional[Index] = None
+    prev_actions: Optional[Index] = None     # joint position commands
+
+    # if any
+    rpy: Optional[Index] = None
+    privilege_obs: Optional[Index] = None
+
+def _as_view(x: torch.Tensor, idx: Optional[Index]) -> torch.Tensor:
+    return x if idx is None else x[..., idx]
+
+def _yaw2Rot(theta: torch.Tensor) -> torch.Tensor:
+    """Convert yaw angle(s) to 2D rotation matrix/matrices."""
+    c, s = torch.cos(theta), torch.sin(theta)
+    R = torch.zeros(theta.shape + (3, 3), device=theta.device, dtype=theta.dtype)
+    R[..., 0, 0] = c
+    R[..., 0, 1] = -s
+    R[..., 1, 0] = s
+    R[..., 1, 1] = c
+    R[..., 2, 2] = 1.0      # Identity in 3D
+    return R
+
+def _apply_yaw_rot_inplace(x: torch.Tensor, obs_group: ObsGroup, yaw: torch.Tensor):
+    R = _yaw2Rot(yaw)
+    for g in ("base_lin_vel", "base_ang_vel", "cmd_vel", "proj_gravity"):
+        idx = getattr(ObsGroup, g)
+        v = _as_view(x, idx)
+        if v is None:
+            continue
+        if v.shape[-1] >= 3:
+            vxyz = v[..., :3]
+            vxyz.copy_(torch.matmul(vxyz.unsqueeze(-2), R).squeeze(-2)) # [B,W,3]
+
+def _sim_slip_inplace(x: torch.Tensor, obs_group: ObsGroup, scale_xy: torch.Tensor):
+    # Simulate slip by shrinking base linear velocity in x-y plane. Keep z as is.
+    if obs_group.base_lin_vel is None:
+        return
+    v = _as_view(x, obs_group.base_lin_vel)
+    if v is None or v.shape[-1] < 2:
+        return
+    v[..., 0:2] *= scale_xy # [B,1] boradcast across W
+
+def _sim_imu_drift_inplace(x: torch.Tensor, obs_group: ObsGroup, bias_lin: torch.Tensor, bias_ang: torch.Tensor):
+    # Bias over the windows on imu channels
+    if obs_group.base_lin_vel is not None:
+        _as_view(x, obs_group.base_lin_vel)[..., 0:3] += bias_lin
+    if obs_group.base_ang_vel is not None:
+        _as_view(x, obs_group.base_ang_vel)[..., 0:3] += bias_ang
+
+def _per_leg_calibration_inplace(x: torch.Tensor, obs_group: ObsGroup, gain_std: float, rng: torch.Generator):
+    # Per-leg joint position calibration noise (NOTE: groups should be contiguous. TODO: check this)
+    for name in ("joint_pos", "joint_vel"):
+        idx = getattr(obs_group, name)
+        v = _as_view(x, idx)
+        if v is None:
+            continue
+        B, W, D = v.shape
+        # assume 3 DoF per leg * 4 legs (12)
+        L = 4 if D % 4 == 0 else 1
+        G = torch.randn((B, 1, L), device=x.device, generator=rng, dtype=x.dtype) * gain_std
+        if L == 4:
+            leg_size = D // 4
+            for leg in range(4):
+                sl = slice(leg * leg_size, (leg + 1) * leg_size)
+                v[..., sl] *= (1.0 + G[..., leg:leg+1])
+        else:
+            v *= (1.0 + torch.randn((B, 1, 1), device=x.device, generator=rng, dtype=x.dtype) * gain_std)
+
+def _sim_deadzone_inplace(x: torch.Tensor, obs_group: ObsGroup, deadzone: float, step: float):
+    # Simulate joint measurement deadzone
+    v = _as_view(x, obs_group.joint_vel)
+    if v is not None and deadzone > 0:
+        mask = v.abs() < deadzone
+        v[mask] = 0.0
+    vq = _as_view(x, obs_group.joint_pos)
+    if vq is not None and step > 0:
+        vq.copy_((vq / step).round() * step)
+
+def _sim_sensor_spike_inplace(x: torch.Tensor, obs_group: ObsGroup, spike_prob: float, spike_mag: float, rng: torch.Generator):
+    # Simulate random sensor spikes
+    for name in ("base_lin_vel", "base_ang_vel"):
+        v = _as_view(x, getattr(obs_group, name))
+        if v is None:
+            continue
+        B, W, D = v.shape
+        mask = torch.rand((B, W, 1), device=x.device, generator=rng) < spike_prob
+        noise = (torch.rand((B, W, D), device=x.device, generator=rng)) * spike_mag
+        v.add_(mask * noise)
 
 def _rand_gen(shape: Tuple[int, ...], device: torch.device, rng: torch.Generator) -> torch.Tensor:
     try:
@@ -335,70 +419,8 @@ def _frame_drop_inplace(x: torch.Tensor, p: float, rng: torch.Generator) -> None
     for t in range(1, T):
         x[:, t][mask[:, t]] = x[:, t - 1][mask[:, t]]
 
-def _temporal_shift(x: torch.Tensor, shift: int) -> torch.Tensor:
-    """ CAUTION: This operation seems too strong for RL tasks. """
-    if shift == 0: return x
-    if shift > 0:
-        return torch.cat([x[:, :1].expand(-1, shift, -1), x[:, :-shift]], dim=1)
-    shift = -shift
-    return torch.cat([x[:, shift:], x[:, -1:].expand(-1, shift, -1)], dim=1)
-
-
-def _temporal_mixing(x: torch.Tensor, strength: float, rng: torch.Generator) -> torch.Tensor:
-    """Mix each sequence with a randomly shifted version; strength in [0,1]. x: [B,T,D]."""
-    if strength <= 0:
-        return x
-    B, T, D = x.shape
-    # random shift per sequence (avoid 0)
-    shifts = torch.randint(1, max(2, T), (B,), device=x.device, generator=rng)
-    # random weight per sequence in [0, strength]
-    alphas = _rand_gen((B,), x.device, rng) * float(strength)
-    out = x.clone()
-    for b in range(B):
-        s = int(shifts[b].item())
-        a = float(alphas[b].item())
-        out[b] = (1.0 - a) * x[b] + a * torch.roll(x[b], shifts=s, dims=0)
-    return out
-
-def _time_warp(x: torch.Tensor, max_scale: float, rng: torch.Generator) -> torch.Tensor:
-    """
-    Monotonic time warp: resample each sequence by a random global speed in [1-max_scale, 1+max_scale],
-    then linearly re-interpolate back to the original length. x: [B,T,D] -> [B,T,D]
-
-    NOTE: 
-        This operation is quite expensive (slow).
-    """
-    if max_scale <= 0: return x
-    B, T, D = x.shape
-    speeds = (1.0 - max_scale) + (2.0 * max_scale) * torch.rand(B, device=x.device, generator=rng)
-    # target time grid [0, T-1]
-    t_out = torch.linspace(0, T - 1, T, device=x.device)
-    out = torch.empty_like(x)
-    for b in range(B):
-        s = float(speeds[b].item())
-        t_in = torch.arange(T, device=x.device) / s
-        t_in = torch.clamp(t_in, 0, T - 1)
-        # linear interpolation
-        t0 = t_in.floor().long()
-        t1 = torch.clamp(t0 + 1, 0, T - 1)
-        w = (t_in - t0.float()).unsqueeze(-1)
-        out[b] = (1 - w) * x[b, t0] + w * x[b, t1]
-    return out
-
-def _channel_dropout_inplace(x: torch.Tensor, p: float, rng: torch.Generator) -> None:
-    """Drop entire feature channels consistently over time: mask shape [B,1,D]. In-place on x: [B,T,D]."""
-    if p <= 0: 
-        return
-    B, T, D = x.shape
-    mask = (_rand_gen((B, 1, D), x.device, rng) >= p).to(x.dtype)
-    x.mul_(mask)
-
 def _time_mask_inplace(x: torch.Tensor, span: int, prob: float, rng: torch.Generator) -> None:
     """Randomly zero a contiguous time span per sequence with probability `prob`.
-    Args:
-        x: [B,T,D]
-        span: maximum span length to mask (clip to [1,T])
-        prob: probability to apply one span mask per sequence
     """
     if prob <= 0 or span <= 0:
         return
@@ -412,49 +434,6 @@ def _time_mask_inplace(x: torch.Tensor, span: int, prob: float, rng: torch.Gener
     for b in torch.nonzero(apply, as_tuple=False).flatten():
         s = int(starts[b].item())
         x[b, s:s+span, :] = 0
-
-def _calibration_noise_inplace(x: torch.Tensor, gain_std: float, bias_std: float, rng: torch.Generator) -> None:
-    """Apply per-channel gain/bias perturbation consistent over time: x <- (1+g)*x + b.
-    g, b have shape [B,1,D]. In-place on x: [B,T,D]."""
-    if gain_std <= 0 and bias_std <= 0:
-        return
-    B, T, D = x.shape
-    if gain_std > 0:
-        g = _randn_like_gen(x.new_empty((B, 1, D)), rng) * gain_std
-    else:
-        g = x.new_zeros((B, 1, D))
-    if bias_std > 0:
-        b = _randn_like_gen(x.new_empty((B, 1, D)), rng) * bias_std
-    else:
-        b = x.new_zeros((B, 1, D))
-    x.mul_(1.0 + g).add_(b)
-
-def _smooth_time_inplace(x: torch.Tensor, kernel_size: int, prob: float) -> None:
-    """Optionally low-pass filter along time using a depthwise 1D conv with triangular kernel.
-    Args:
-        x: [B,T,D]
-        kernel_size: odd int >=3; if <=0 no-op
-        prob: apply smoothing with this probability
-    """
-    if kernel_size <= 1 or prob <= 0:
-        return
-    B, T, D = x.shape
-    # coin flip once per batch to avoid per-sample branching
-    if torch.rand((), device=x.device) >= prob:
-        return
-    K = int(kernel_size)
-    if K % 2 == 0:
-        K += 1
-    # triangular kernel
-    base = torch.arange(1, (K//2)+2, device=x.device, dtype=x.dtype)
-    kernel = torch.cat([base, base[:-1].flip(0)])
-    kernel = (kernel / kernel.sum()).view(1, 1, K)
-    # depthwise conv over [B,D,T]
-    x_t = x.permute(0, 2, 1)  # [B,D,T]
-    weight = kernel.expand(D, 1, K)
-    pad = K // 2
-    x_t = torch.nn.functional.conv1d(x_t, weight, padding=pad, groups=D)
-    x.copy_(x_t.permute(0, 2, 1))
 
 @torch.no_grad()
 def _valid_window_starts(dones: torch.Tensor, W: int) -> np.ndarray:
@@ -482,53 +461,29 @@ def _valid_window_starts(dones: torch.Tensor, W: int) -> np.ndarray:
     return np.array(valid, dtype=np.int64)
 
 @torch.no_grad()
-def sample_byol_windows(
+def sample_byol_windows_phy(
     obs: torch.Tensor,                 # [T,N,D_obs]
     dones: torch.Tensor,               # [T,N]
-    W: int, B: int, max_shift: int,
-    noise_std: float, feat_drop: float, frame_drop: float,
-    time_warp_scale: float,
-    # Extra augmentations (all optional; default disabled)
-    ch_drop: float = 0.0,
-    time_mask_prob: float = 0.0,
-    time_mask_span: int = 0,
-    gain_std: float = 0.0,
-    bias_std: float = 0.0,
-    smooth_prob: float = 0.0,
-    smooth_kernel: int = 0,
-    mix_strength: float = 0.0,
+    W: int, B: int,
+    obs_group: ObsGroup,
+    # general augmentations
+    delay: int,
+    gaussian_jitter_std: float,
+    frame_drop: float,
+    # physics-informed augmentations
+    yaw_rot_max: float = math.radians(10.0),
+    imu_drift_lin_std: float = 0.01,
+    imu_drift_ang_std: float = 0.01,
+    slip_lin_scale_range: Tuple[float,float] = (0.7, 1.0),
+    joint_gain_std: float = 0.01,
+    joint_deadzone: float = 0.0,
+    joint_pos_step: float = 0.0,
+    sensor_spike_prob: float = 0.01,
+    sensor_spike_mag: float = 0.05,
     device: torch.device = torch.device("cpu"),
-    actions: Optional[torch.Tensor] = None,  # [T,N,A] or None
-) -> Tuple[
-        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        List[Tuple[int,int]],
-        int,
-    ]:
+) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[int,int]], int]:
     """
     Sample B window pairs (v1, v2) with independent augs.
-    
-    Args:
-        obs: [T,N,D_obs] float tensor of observations
-        dones: [T,N] bool tensor with True where episode ended at t
-        W: window length
-        B: batch size (number of pairs)
-        max_shift: max temporal shift (frames) between v1 and v2; 0 = no shift
-        noise_std: per-frame Gaussian noise stddev
-        feat_drop: per-frame Bernoulli feature dropout probability
-        frame_drop: per-sequence Bernoulli frame-drop probability
-        time_warp_scale: max time warp scale (0 = no warp)
-        device: target device for output tensors
-        actions: optional [T,N,A] float tensor of actions (if provided, also return action windows)
-
-        ch_drop: per-sequence channel dropout probability (consistent over time)
-        time_mask_prob: per-sequence probability to apply a random time-span mask
-        time_mask_span: max length of time-span mask (in frames: use W//8, e.g., W=16 -> span=2)
-        gain_std: per-sequence per-channel gain noise stddev (consistent over time)
-        bias_std: per-sequence per-channel bias noise stddev (consistent over time)
-        smooth_prob: per-batch probability to apply low-pass smoothing
-        smooth_kernel: odd kernel size >=3 for low-pass smoothing along time
-        mix_strength: strength of temporal mixing augmentation (0 = no mixing)
     """
     W_use = min(int(W), int(obs.shape[0]))
     starts = _valid_window_starts(dones, W_use)
@@ -538,66 +493,129 @@ def sample_byol_windows(
     idx = np.random.choice(len(starts), size=min(B, len(starts)), replace=replace)
     picks = starts[idx].tolist()
 
-    v1o, v2o, v1a, v2a = [], [], [], []
+    v1o, v2o = [], []
     T_total = obs.shape[0]
     for (s, n) in picks:
         w1o = obs[s : s + W_use, n, :].clone()
-        delta = np.random.randint(-max_shift, max_shift + 1) if max_shift > 0 else 0
+        delta = np.random.randint(-delay, delay + 1) if delay > 0 else 0  # random delay shift
         s2 = max(0, min(s + delta, T_total - W_use))
         w2o = obs[s2 : s2 + W_use, n, :].clone()
         v1o.append(w1o); v2o.append(w2o)
-        if actions is not None:
-            w1a = actions[s  : s  + W_use, n, :].clone()
-            w2a = actions[s2 : s2 + W_use, n, :].clone()
-            v1a.append(w1a); v2a.append(w2a)
-
     v1o = torch.stack(v1o, dim=0).to(device)  # [B,W_use,D_obs]
     v2o = torch.stack(v2o, dim=0).to(device)
 
     g1 = torch.Generator(device=device).manual_seed(torch.randint(0, 2**31 - 1, (1,)).item())
     g2 = torch.Generator(device=device).manual_seed(torch.randint(0, 2**31 - 1, (1,)).item())
 
-    _feature_jitter(v1o, noise_std, feat_drop, g1)
-    _feature_jitter(v2o, noise_std, feat_drop, g2)
-
-    # calibration (per-channel gain/bias)
-    _calibration_noise_inplace(v1o, gain_std, bias_std, g1)
-    _calibration_noise_inplace(v2o, gain_std, bias_std, g2)
-
-    # channel-consistent dropout
-    _channel_dropout_inplace(v1o, ch_drop, g1)
-    _channel_dropout_inplace(v2o, ch_drop, g2)
-
-    # time-span masking
-    _time_mask_inplace(v1o, time_mask_span, time_mask_prob, g1)
-    _time_mask_inplace(v2o, time_mask_span, time_mask_prob, g2)
-
-    # frame dropout (temporal consistency)
+    # general augmentations
+    if gaussian_jitter_std > 0:
+        _feature_jitter(v1o, gaussian_jitter_std, 0.0, g1)
+        _feature_jitter(v2o, gaussian_jitter_std, 0.0, g2)
     _frame_drop_inplace(v1o, frame_drop, g1)
     _frame_drop_inplace(v2o, frame_drop, g2)
 
-    if max_shift > 0:
-        # random temporal shift (independent for v1 and v2)
-        v1o = _temporal_shift(v1o, int(torch.randint(-max_shift, max_shift + 1, (1,)).item()))
-        v2o = _temporal_shift(v2o, int(torch.randint(-max_shift, max_shift + 1, (1,)).item()))
+    # physics-informed augmentations
+    def _apply_physics(vx, rng):
+        B, W, D = vx.shape
+        # sample window-wise random variables
+        yaw = (torch.rand((B,1), generator=rng, device=device) * 2 - 1) * yaw_rot_max
+        fxy = torch.empty((B,1), device=device).uniform_(*slip_lin_scale_range)
+        b_lin = torch.randn((B,1,3), generator=rng, device=device) * imu_drift_lin_std
+        b_ang = torch.randn((B,1,3), generator=rng, device=device) * imu_drift_ang_std
 
-    if time_warp_scale > 0:
-        # time warp (independent for v1 and v2)
-        v1o = _time_warp(v1o, time_warp_scale, g1)
-        v2o = _time_warp(v2o, time_warp_scale, g2)
+        _apply_yaw_rot_inplace(vx, obs_group, yaw)
+        _sim_slip_inplace(vx, obs_group, fxy)
+        _sim_imu_drift_inplace(vx, obs_group, b_lin, b_ang)
+        _per_leg_calibration_inplace(vx, obs_group, joint_gain_std, rng)
+        _sim_deadzone_inplace(vx, obs_group, joint_deadzone, joint_pos_step)
+        _sim_sensor_spike_inplace(vx, obs_group, sensor_spike_prob, sensor_spike_mag, rng)
+    
+    _apply_physics(v1o, g1)
+    _apply_physics(v2o, g2)
 
-    if mix_strength > 0.0:
-        # temporal mixing (independent for v1 and v2)
-        v1o = _temporal_mixing(v1o, mix_strength, g1)
-        v2o = _temporal_mixing(v2o, mix_strength, g2)
+    return v1o, v2o, picks, len(picks)
 
-    # optional smoothing at the end
-    _smooth_time_inplace(v1o, smooth_kernel, smooth_prob)
-    _smooth_time_inplace(v2o, smooth_kernel, smooth_prob)
 
-    if actions is None:
-        return v1o, v2o, picks, len(picks)
+# @torch.no_grad()
+# def sample_byol_windows(
+#     obs: torch.Tensor,                 # [T,N,D_obs]
+#     dones: torch.Tensor,               # [T,N]
+#     W: int, B: int, max_shift: int,
+#     noise_std: float, feat_drop: float, frame_drop: float,
+#     time_warp_scale: float,
+#     # Extra augmentations (all optional; default disabled)
+#     ch_drop: float = 0.0,
+#     time_mask_prob: float = 0.0,
+#     time_mask_span: int = 0,
+#     gain_std: float = 0.0,
+#     bias_std: float = 0.0,
+#     smooth_prob: float = 0.0,
+#     smooth_kernel: int = 0,
+#     mix_strength: float = 0.0,
+#     device: torch.device = torch.device("cpu"),
+# ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[int,int]], int]:
+#     """
+#     Sample B window pairs (v1, v2) with independent augs.
+#     """
+#     W_use = min(int(W), int(obs.shape[0]))
+#     starts = _valid_window_starts(dones, W_use)
+#     if len(starts) == 0:
+#         starts = np.array([(0, n) for n in range(obs.shape[1])], dtype=np.int64)
+#     replace = len(starts) < B
+#     idx = np.random.choice(len(starts), size=min(B, len(starts)), replace=replace)
+#     picks = starts[idx].tolist()
 
-    v1a = torch.stack(v1a, dim=0).to(device)  # [B,W,A]
-    v2a = torch.stack(v2a, dim=0).to(device)
-    return (v1o, v1a), (v2o, v2a), picks, len(picks)
+#     v1o, v2o = [], []
+#     T_total = obs.shape[0]
+#     for (s, n) in picks:
+#         w1o = obs[s : s + W_use, n, :].clone()
+#         delta = np.random.randint(-max_shift, max_shift + 1) if max_shift > 0 else 0
+#         s2 = max(0, min(s + delta, T_total - W_use))
+#         w2o = obs[s2 : s2 + W_use, n, :].clone()
+#         v1o.append(w1o); v2o.append(w2o)
+
+#     v1o = torch.stack(v1o, dim=0).to(device)  # [B,W_use,D_obs]
+#     v2o = torch.stack(v2o, dim=0).to(device)
+
+#     g1 = torch.Generator(device=device).manual_seed(torch.randint(0, 2**31 - 1, (1,)).item())
+#     g2 = torch.Generator(device=device).manual_seed(torch.randint(0, 2**31 - 1, (1,)).item())
+
+#     _feature_jitter(v1o, noise_std, feat_drop, g1)
+#     _feature_jitter(v2o, noise_std, feat_drop, g2)
+
+#     # calibration (per-channel gain/bias)
+#     _calibration_noise_inplace(v1o, gain_std, bias_std, g1)
+#     _calibration_noise_inplace(v2o, gain_std, bias_std, g2)
+
+#     # channel-consistent dropout
+#     _channel_dropout_inplace(v1o, ch_drop, g1)
+#     _channel_dropout_inplace(v2o, ch_drop, g2)
+
+#     # time-span masking
+#     _time_mask_inplace(v1o, time_mask_span, time_mask_prob, g1)
+#     _time_mask_inplace(v2o, time_mask_span, time_mask_prob, g2)
+
+#     # frame dropout (temporal consistency)
+#     _frame_drop_inplace(v1o, frame_drop, g1)
+#     _frame_drop_inplace(v2o, frame_drop, g2)
+
+#     if max_shift > 0:
+#         # random temporal shift (independent for v1 and v2)
+#         v1o = _temporal_shift(v1o, int(torch.randint(-max_shift, max_shift + 1, (1,)).item()))
+#         v2o = _temporal_shift(v2o, int(torch.randint(-max_shift, max_shift + 1, (1,)).item()))
+
+#     if time_warp_scale > 0:
+#         # time warp (independent for v1 and v2)
+#         v1o = _time_warp(v1o, time_warp_scale, g1)
+#         v2o = _time_warp(v2o, time_warp_scale, g2)
+
+#     if mix_strength > 0.0:
+#         # temporal mixing (independent for v1 and v2)
+#         v1o = _temporal_mixing(v1o, mix_strength, g1)
+#         v2o = _temporal_mixing(v2o, mix_strength, g2)
+
+#     # optional smoothing at the end
+#     _smooth_time_inplace(v1o, smooth_kernel, smooth_prob)
+#     _smooth_time_inplace(v2o, smooth_kernel, smooth_prob)
+
+#     return v1o, v2o, picks, len(picks)

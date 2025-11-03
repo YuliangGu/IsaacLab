@@ -3,11 +3,11 @@ import os
 import sys
 
 try:
-    from myrl.utils_core import BYOLSeq, ObsEncoder, ActionEncoder, sample_byol_windows
+    from myrl.utils_core import BYOLSeq, ObsEncoder, sample_byol_windows
 except ModuleNotFoundError:
     # Ensure project root on sys.path when launching via path runners
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-    from myrl.utils_core import BYOLSeq, ObsEncoder, ActionEncoder, sample_byol_windows
+    from myrl.utils_core import BYOLSeq, ObsEncoder, sample_byol_windows
 
 
 def test_byol_seq_shapes_and_grads():
@@ -15,22 +15,15 @@ def test_byol_seq_shapes_and_grads():
 
     # small synthetic setup
     B, W = 8, 6
-    D_obs, D_act = 20, 5
+    D_obs = 20
     z_dim, proj_dim, feat_dim = 16, 32, 24
 
     obs_enc = ObsEncoder(D_obs, feat_dim=feat_dim).to(device)
-    act_enc = ActionEncoder(D_act, feat_dim=feat_dim).to(device)
-    model = BYOLSeq(obs_enc, z_dim=z_dim, proj_dim=proj_dim, action_encoder=act_enc).to(device)
+    model = BYOLSeq(obs_enc, z_dim=z_dim, proj_dim=proj_dim).to(device)
 
     # two random views
-    v1 = (
-        torch.randn(B, W, D_obs, device=device),
-        torch.randn(B, W, D_act, device=device),
-    )
-    v2 = (
-        torch.randn(B, W, D_obs, device=device),
-        torch.randn(B, W, D_act, device=device),
-    )
+    v1 = torch.randn(B, W, D_obs, device=device)
+    v2 = torch.randn(B, W, D_obs, device=device)
 
     # forward and loss
     loss = model.loss(v1, v2)
@@ -80,7 +73,6 @@ def test_sample_byol_windows_respects_dones():
         frame_drop=0.0,
         time_warp_scale=0.0,
         device=device,
-        actions=None,
     )
 
     assert K == len(picks) and K > 0, "Should sample at least one valid window"

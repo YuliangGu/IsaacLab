@@ -106,7 +106,6 @@ def main():
             "byol_time_warp_scale": 0.0,
             "byol_feat_drop": 0.0,
             "byol_frame_drop": 0.0,
-            "byol_use_actions": False,
         },
     }
 
@@ -121,4 +120,3 @@ if __name__ == "__main__":
     if _pkg_root not in sys.path:
         sys.path.insert(0, _pkg_root)
     main()
-

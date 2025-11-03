@@ -73,7 +73,6 @@ def main():
         byol_time_warp_scale=0.0,
         byol_feat_drop=0.05,
         byol_frame_drop=0.05,
-        byol_use_actions=False,
     )
 
     # Initialize rollout storage (like runner does)
