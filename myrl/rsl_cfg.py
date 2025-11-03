@@ -21,8 +21,8 @@ class PPObyolRunnerCfg(RslRlOnPolicyRunnerCfg):
         # default ActorCritic hparams
 
         # BYOL extras
-        rpo_actor: bool = False
-        rpo_alpha: float = 0.5
+        rpo_actor: bool = True
+        rpo_alpha: float = 0.3
         ctx_mode: str = "concat"  # 'film'|'concat'|'none'
         ctx_dim: int = 128          # Must match algorithm.byol_z_dim
         feat_dim: int = 128        # ObsEncoder output dim

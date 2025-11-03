@@ -31,7 +31,7 @@ class PPOWithBYOL(PPO):
 
             # BYOL augmentations
             byol_delay: int = 2,
-            byol_gaussian_jitter_std: float = 0.01,
+            byol_gaussian_jitter_std: float = 0.05,
             byol_causal_padding_proportion: float = 0.1,
             byol_frame_drop: float = 0.1,
 

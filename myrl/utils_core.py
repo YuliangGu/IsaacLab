@@ -70,19 +70,70 @@ class SeqEncoder(nn.Module):
         feats = self.obs_encoder(obs_seq.reshape(B * W, D)).reshape(B, W, -1)  # [B,W,F]
         return feats
 
-    def forward(self, obs_seq: torch.Tensor) -> torch.Tensor:
+    def forward(self, obs_seq: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
+        # is_causal is unused here; for compatibility with TransformerEncoder
         feats = self._encode_frames(obs_seq)       # [B,W,F]: batch, window, feat_dim
         out, hT = self.gru(feats)  # out: [B,W,z], hT: [1,B,z]
+        
         if self.output_type == "last":
             return hT.squeeze(0)    # [B,z]
         elif self.output_type == "mean":
-            return out.mean(dim=1)   # [B,z]
+            return out.mean(dim=1)   # [B,z] 
         elif self.output_type == "attn":
-            w = torch.softmax(self.attn(out).squeeze(-1), dim=1)  # [B,W]
-            return (out * w.unsqueeze(-1)).sum(dim=1)
+            attn_weights = torch.softmax(self.attn(out).squeeze(-1), dim=-1)  # [B,W]
+            z = (out * attn_weights.unsqueeze(-1)).sum(dim=1)                  # [B,z]
+            return z
         else:
             raise ValueError(f"Unknown output_type: {self.output_type}")
 
+# Causal Transformer Encoder (upgrade for SeqEncoder)
+class TransformerEncoder(nn.Module):
+    """ Transformer encoder for sequential data. """
+    def __init__(self,
+                 obs_encoder: ObsEncoder,
+                 z_dim: int,
+                 output_type: str = "last",
+                 n_layers: int = 2,
+                 n_heads: int = 4,
+                 dim_feedforward: int = 256,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.obs_encoder = obs_encoder
+        if output_type not in ("last", "mean"):
+            raise ValueError(f"Unsupported output_type for TransformerEncoder: {output_type}")
+        self.output_type = str(output_type)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=z_dim,
+                                                   nhead=n_heads,
+                                                   dim_feedforward=dim_feedforward,
+                                                   dropout=dropout,
+                                                   activation='relu',
+                                                   batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.input_proj = nn.Linear(self.obs_encoder.out_dim, z_dim)
+
+    def _encode_frames(self, obs_seq: torch.Tensor) -> torch.Tensor:
+        B, W, D = obs_seq.shape # batch, window, obs_dim
+        feats = self.obs_encoder(obs_seq.reshape(B * W, D)).reshape(B, W, -1)  # [B,W,F]
+        return feats
+    
+    def forward(self, obs_seq: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
+        feats = self._encode_frames(obs_seq)       # [B,W,F]: batch, window, feat_dim
+        x = self.input_proj(feats)                 # [B,W,z_dim]
+        
+        if is_causal:
+            W = x.size(1)
+            mask = torch.triu(torch.ones((W, W), device=x.device), diagonal=1).bool()
+        else:
+            mask = None
+        
+        out = self.transformer_encoder(x, mask=mask)  # [B,W,z_dim]
+        if self.output_type == "last":
+            return out[:, -1, :]    # [B,z_dim]
+        elif self.output_type == "mean":
+            return out.mean(dim=1)   # [B,z_dim]
+        else:
+            raise ValueError(f"Unknown output_type: {self.output_type}")
+        
 class BYOLSeq(nn.Module):
     """
     BYOL for sequential data (BYOL-Seq).
@@ -108,10 +159,14 @@ class BYOLSeq(nn.Module):
                  z_dim: int = 128,
                  proj_dim: int = 128,
                  tau: float = 0.996,
-                 output_type: str = "last",
-                 use_information_bottleneck: bool = False):
+                 output_type: str = "mean",
+                 use_information_bottleneck: bool = False,
+                 use_transformer: bool = False):
         super().__init__()
-        self.f_online = SeqEncoder(obs_encoder, z_dim=z_dim, output_type=output_type)
+        if use_transformer:
+            self.f_online = TransformerEncoder(obs_encoder, z_dim=z_dim, output_type=output_type)
+        else:
+            self.f_online = SeqEncoder(obs_encoder, z_dim=z_dim, output_type=output_type)
         self.g_online = mlp(z_dim, proj_dim)
         self.q_online = mlp(proj_dim, proj_dim)
         self.use_information_bottleneck = bool(use_information_bottleneck)
@@ -164,8 +219,8 @@ class BYOLSeq(nn.Module):
         z1 = self.f_online(v1)          # [B, z]
         z2 = self.f_online(v2)
         if self.use_information_bottleneck:
-            z1, kl1 = self._apply_information_bottleneck(z1, sample=True)
-            z2, kl2 = self._apply_information_bottleneck(z2, sample=True)
+            z1, kl1 = self._apply_information_bottleneck(z1, sample=False)
+            z2, kl2 = self._apply_information_bottleneck(z2, sample=False)
             self._last_ib_kl = 0.5 * (kl1 + kl2)
         else:
             self._last_ib_kl = z1.new_zeros(())
@@ -176,11 +231,12 @@ class BYOLSeq(nn.Module):
         
         # Targets (no grad)
         with torch.no_grad():
-            z1t = self.f_targ(v1)
-            z2t = self.f_targ(v2)
+            # Non-causal info flows into target networks. Use IB to limit excessive leakage.
+            z1t = self.f_targ(v1, is_causal=False)
+            z2t = self.f_targ(v2, is_causal=False)
             if self.use_information_bottleneck:
-                z1t, _ = self._apply_information_bottleneck(z1t, sample=False) # targets use mean
-                z2t, _ = self._apply_information_bottleneck(z2t, sample=False)
+                z1t, _ = self._apply_information_bottleneck(z1t, sample=True) 
+                z2t, _ = self._apply_information_bottleneck(z2t, sample=True)
             p1t = self.g_targ(z1t)
             p2t = self.g_targ(z2t)
         return h1, h2, p1t, p2t
