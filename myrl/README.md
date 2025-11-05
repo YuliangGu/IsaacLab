@@ -32,12 +32,12 @@ Requires:
 
 ### Train via Isaac Lab script
 
-Use the training script under `scripts/reinforcement_learning/rsl_rl/train_byol.py`.
+Use the training script under `myrl/algorithms/train_byol.py`.
 
 - To run (BYOL default on):
 
 ```
-isaaclab.bat -p scripts\reinforcement_learning\rsl_rl\train_byol.py --task  Isaac-Velocity-Rough-Unitree-Go2-v0 --num_envs=1000 --headless
+isaaclab.bat -p myrl\algorithms\train_byol.py --task  Isaac-Velocity-Rough-Unitree-Go2-v0 --num_envs=1000 --headless
 ```
 
 

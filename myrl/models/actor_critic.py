@@ -10,7 +10,7 @@ import torch.nn as nn
 from torch.distributions import Normal
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
-from myrl.utils_core import ObsEncoder, FiLM
+from myrl.utils.core import ObsEncoder, FiLM
 
 """ This is the original RSL-RL ActorCritic (copied here for extension) """
 class ActorCritic(nn.Module):
@@ -174,9 +174,7 @@ class ActorCritic(nn.Module):
 
 class ActorCriticAug(ActorCritic):
     """
-    Augmented ActorCritic with:
-      - shared ObsEncoder feeding both heads
-      - optional context 'c_t' via FiLM or concat
+    A lightweight ActorCritic with shared encoder and optional context conditioning.
     """
     def __init__(self, *base_args,
                  rpo_actor: bool = False,
@@ -185,24 +183,7 @@ class ActorCriticAug(ActorCritic):
                  ctx_dim: int = 32,
                  feat_dim: Optional[int] = 128,  # ObsEncoder output dim; defaults to obs dim
                  **kwargs):
-        """Augmented ActorCritic compatible with rsl-rl.
-
-        Args:
-            rpo_actor (bool): Whether to apply RPO-style mean perturbations during sampling.
-            rpo_alpha (float): Magnitude of the uniform perturbation applied when `rpo_actor` is True.
-            ctx_mode (str): Context mode to use ('none', 'concat', 'film').
-            ctx_dim (int): Dimension of the context vector.
-            feat_dim (Optional[int]): Feature dimension for the encoder. If None, defaults to observation dimension.
-            actor_layer_norm (bool): use a tiny layer norm if it takes context input (default: False).
-
-        Description:
-            Features: x_t -> encoder -> z_t
-            contexts: c_t (from BYOL GRU, set externally)
-            fusion: 
-                - none: z_t
-                - concat: [z_t, c_t]
-                - film: FiLM(z_t, c_t)
-        """
+        """Augmented ActorCritic compatible with rsl-rl."""
 
         # Stash model hparams we need to rebuild heads after adding encoder
         actor_hidden_dims = kwargs.get("actor_hidden_dims", [256, 256, 256])
@@ -253,11 +234,6 @@ class ActorCriticAug(ActorCritic):
         # Runtime inputs set by algorithm (optional)
         self._ctx: Optional[torch.Tensor] = None
 
-        # print workflow diagram
-        print("=================== PPO_BYOL WORKFLOW ====================")
-        self._draw_model_diagram()
-        print("========================================================")
-
     def _actor_distribution_from_features(
         self, features: torch.Tensor, apply_rpo: bool
     ) -> Normal:
@@ -277,60 +253,8 @@ class ActorCriticAug(ActorCritic):
             mean = mean + noise
 
         return Normal(mean, std)
-    
-    def _draw_model_diagram(self):
-        """Prints a diagram of the model architecture.
-
-        Includes:
-        - Policy path (shared ObsEncoder -> optional context via FiLM/concat -> heads)
-        - BYOL path (sequence encoder + GRU -> online/target projection; context c_t comes from algorithm)
-        """
-        obs_dim = getattr(self, "_obs_dim", None)
-        feat_dim = getattr(self.encoder, "out_dim", None) if hasattr(self, "encoder") else None
-        ctx_dim = int(getattr(self, "ctx_dim", 0))
-        head_in = feat_dim + (ctx_dim if (self.ctx_mode == "concat" and ctx_dim > 0) else 0)
-
-        def fmt_dim(x):
-            if x is None:
-                return "?"
-            try:
-                return str(int(x))
-            except Exception:
-                return str(x)
-
-        lines: list[str] = []
-
-        # Section: Policy path
-        lines.append("POLICY PATH")
-        lines.append(f"  x_t [N,{fmt_dim(obs_dim)}] --ObsEncoder--> z_t [N,{fmt_dim(feat_dim)}]")
-        if self.ctx_mode == "film" and self.film is not None and ctx_dim > 0:
-            lines.append(f"  c_t [N,{fmt_dim(ctx_dim)}] --FiLM(z_t, c_t)--> z*_t [N,{fmt_dim(feat_dim)}]")
-            head_in_now = feat_dim
-        elif self.ctx_mode == "concat" and ctx_dim > 0:
-            lines.append(f"  c_t [N,{fmt_dim(ctx_dim)}] --concat--> z*_t [N,{fmt_dim(head_in)}]")
-            head_in_now = head_in
-        else:
-            lines.append("  (no context)  z*_t = z_t")
-            head_in_now = feat_dim
-
-        lines.append(f"  z*_t [N,{fmt_dim(head_in_now)}] --ActorMLP--> μ, σ -> a_t")
-        lines.append(f"  z*_t [N,{fmt_dim(head_in_now)}] --CriticMLP--> V(s_t)")
-
-        # Section: BYOL path (informational)
-        lines.append("")
-        lines.append("BYOL PATH (algorithm side; provides c_t)")
-        lines.append("  Window W of x_{t−W+1..t} (and optional a_{t−W..t−1})")
-        lines.append(f"    └─> ObsEncoder (shared or separate) -> frames [B,W,{fmt_dim(feat_dim)}]")
-        lines.append(f"         └─> GRU -> z_seq [B,{fmt_dim(ctx_dim if ctx_dim > 0 else 'z_dim')}] = c_t")
-        lines.append("         ├─ online:  g_online -> q_online")
-        lines.append("         └─ target:  f_targ (EMA), g_targ (EMA)")
-        lines.append("     Loss:  BYOL(q_online, stopgrad(q_target))")
-        lines.append("     Note: c_t is fed into policy (FiLM/concat) each step.")
-
-        print("\n".join(lines))
 
     def _features(self, x: torch.Tensor, c: torch.Tensor | None) -> torch.Tensor:
-        """ shared feature extractor with optional context """
         z = self.encoder(x)  # [B,F]
         if self.film is not None:
             z = self.film(z, c)
@@ -373,14 +297,14 @@ class ActorCriticAug(ActorCritic):
 
     # --- normalization updates (only on raw obs) ---
     def update_normalization(self, obs):
+        """Keep the running stats in sync with the encoder/ctx-expanded features."""
         if self.actor_obs_normalization:
-            z_a = self.get_actor_obs_raw(obs)
+            z_a = self.get_actor_obs(obs)
             self.actor_obs_normalizer.update(z_a)
         if self.critic_obs_normalization:
-            z_c = self.get_critic_obs_raw(obs)
+            z_c = self.get_critic_obs(obs)
             self.critic_obs_normalizer.update(z_c)
 
     # --- rollout-time hooks used by PPOWithBYOL ---
     def set_belief(self, c_t: Optional[torch.Tensor]):
         self._ctx = c_t
-

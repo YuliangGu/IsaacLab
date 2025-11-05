@@ -14,9 +14,12 @@ import os
 from isaaclab.app import AppLauncher
 
 # Ensure repository root is importable so `import myrl` resolves when running via kit launcher
-_repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+_repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
+_cli_dir = os.path.join(_repo_root, "scripts", "reinforcement_learning", "rsl_rl")
+if _cli_dir not in sys.path:
+    sys.path.insert(0, _cli_dir)
 
 # local imports
 import cli_args  # isort: skip
@@ -106,8 +109,8 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
-from myrl.runner_BYOL import OnPolicyRunnerBYOL
-from myrl.rsl_cfg import PPObyolRunnerCfg
+from myrl.runners.byol import OnPolicyRunnerBYOL
+from myrl.config.rsl_cfg import PPObyolRunnerCfg
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 
@@ -124,7 +127,7 @@ torch.backends.cudnn.benchmark = False
 """
 
 def _overlay(cfg_1, cfg_2):
-    """overlay cfg_2 on top of cfg_1"""
+    """overlay cfg_2 on top of cfg_1. Dont overwrite existing fields in cfg_1."""
     d1 = cfg_1.to_dict()
     d2 = cfg_2.to_dict()
     d1.update(d2)
@@ -208,11 +211,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg.algorithm = _overlay(PPObyolRunnerCfg.algorithm(), agent_cfg.algorithm)
         agent_cfg.class_name = "OnPolicyRunnerBYOL"
         agent_cfg.policy.class_name = "ActorCriticAug"
+        agent_cfg.policy.actor_obs_normalization = True
+        agent_cfg.policy.critic_obs_normalization = True
+        agent_cfg.policy.noise_std_type = "log"
         agent_cfg.algorithm.class_name = "PPOWithBYOL"
         agent_cfg.algorithm.desired_kl = 0.015 # default was 0.01
-        agent_cfg.algorithm.value_loss_coef = 1.0 # default was 1.0
-        agent_cfg.algorithm.max_grad_norm = 1.0 # default was 1.0
-        agent_cfg.algorithm.normalize_advantage_per_mini_batch = False # default was False
+        agent_cfg.algorithm.normalize_advantage_per_mini_batch = True
+
         if args_cli.byol_debug:
             print("[BYOL DEBUG] Effective agent config after BYOL overlay:")
             print_dict(agent_cfg.to_dict(), nesting=4)

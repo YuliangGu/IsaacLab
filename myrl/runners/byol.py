@@ -14,14 +14,11 @@ from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 
-from myrl.ppo_BYOL import PPOWithBYOL
-from myrl.modules import ActorCriticAug
+from myrl.algorithms.ppo_byol import PPOWithBYOL
+from myrl.models import ActorCriticAug
 
-
-""" This is the OnPolicyRunner code from rsl-rl, copied here support PPO with BYOL auxiliary loss."""
+""" This is the OnPolicyRunner code from rsl-rl. Copied and modified to add BYOL-specific features."""
 class OnPolicyRunner:
-    """On-policy runner for training and evaluation of actor-critic methods."""
-
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
@@ -160,7 +157,6 @@ class OnPolicyRunner:
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
 
-            # Clear episode infos
             ep_infos.clear()
             # Save code state
             if it == start_iter and (self.log_dir is not None) and not self.disable_logs:
@@ -473,7 +469,6 @@ class OnPolicyRunnerBYOL(OnPolicyRunner):
         self._byol_ema = None  # type: float | None
         self._byol_level_min = int(byol_curr_cfg.get("min_level", 0))
         self._byol_level_max = int(byol_curr_cfg.get("max_level", 8))
-        self._byol_z_score = None
 
     def save(self, path: str, infos=None):
         # -- Save model
@@ -547,7 +542,6 @@ class OnPolicyRunnerBYOL(OnPolicyRunner):
         ).to(self.device)
 
         # initialize the algorithm
-        # Optionally print effective algo kwargs for debugging
         debug_byol = bool(self.cfg.get("byol_debug", False)) if isinstance(self.cfg, dict) else False
         if debug_byol:
             try:
@@ -555,6 +549,11 @@ class OnPolicyRunnerBYOL(OnPolicyRunner):
                 print("[BYOL-DEBUG] Algo kwargs:", dbg)
             except Exception:
                 pass
+
+        if self.alg_cfg.get("total_num_iters") in (None, 0):
+            runner_iters = self.cfg.get("max_iterations")
+            if runner_iters is not None:
+                self.alg_cfg["total_num_iters"] = runner_iters
 
         alg_class = eval(self.alg_cfg.pop("class_name"))
         if alg_class != PPOWithBYOL:

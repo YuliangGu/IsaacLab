@@ -1,8 +1,8 @@
 import math
 import torch, torch.nn as nn, numpy as np
 import torch.nn.functional as F
-from typing import Optional, Tuple, List, Union
-from dataclasses import dataclass
+from typing import Iterable, Optional, Tuple, List, Union, Dict
+from dataclasses import dataclass, fields
 
 def l2norm(x: torch.Tensor) -> torch.Tensor:
     return F.normalize(x, dim=-1)
@@ -15,8 +15,8 @@ def layer_init(layer: nn.Linear, std: float = math.sqrt(2.0), bias_const: float 
 def mlp(in_dim: int, out_dim: int) -> nn.Sequential:
     return nn.Sequential(
         nn.Linear(in_dim, 256),
-        # nn.BatchNorm1d(512), # BatchNorm for heterogeneous data
-        nn.LayerNorm(256),  # use LayerNorm instead of BatchNorm
+        # nn.BatchNorm1d(512),  # BatchNorm for heterogeneous data
+        nn.LayerNorm(256),      # use LayerNorm instead of BatchNorm
         nn.ReLU(inplace=True),
         nn.Linear(256, out_dim),
     )
@@ -27,16 +27,13 @@ class ObsEncoder(nn.Module):
         self.net = nn.Sequential(
             layer_init(nn.Linear(obs_dim, feat_dim)),
             nn.ReLU(inplace=True),
-        ) #Just a single linear layer
+        )
         self.out_dim = feat_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 class FiLM(nn.Module):
-    """
-    Feature-wise Linear Modulation (FiLM) layer. See: https://arxiv.org/abs/1709.07871
-    """
     def __init__(self, ctx_dim: int, feat_dim: int):
         super().__init__()
         self.gamma = nn.Linear(ctx_dim, feat_dim)
@@ -49,44 +46,44 @@ class FiLM(nn.Module):
         return z * (1.0 + self.gamma(c)) + self.beta(c)
 
 class SeqEncoder(nn.Module):
-    """
-    Sequence encoder: ObsEncoder -> GRU -> z_T
-    Accepts input as:
-        - obs_seq:  Tensor[B, W, D_obs]
-    Returns: Tensor[B, z_dim]
-    """
     def __init__(self, obs_encoder: ObsEncoder, z_dim: int, output_type: str = "last"):
         super().__init__()
         self.obs_encoder = obs_encoder
         self.gru = nn.GRU(input_size=self.obs_encoder.out_dim,
                           hidden_size=z_dim,
                           batch_first=True)
+        for name, param in self.gru.named_parameters():
+            if 'weight' in name:
+                nn.init.orthogonal_(param)
+            elif 'bias' in name:
+                nn.init.constant_(param, 1.0)
+                
+        if output_type not in ("last", "mean", "attn"):
+            raise ValueError(f"Unsupported output_type for SeqEncoder: {output_type}")
         self.output_type = str(output_type)
         if self.output_type == "attn":
-            self.attn = nn.Linear(z_dim, 1)
+            self.attn = layer_init(nn.Linear(z_dim, 1), std=0.1)
 
     def _encode_frames(self, obs_seq: torch.Tensor) -> torch.Tensor:
-        B, W, D = obs_seq.shape # batch, window, obs_dim
+        B, W, D = obs_seq.shape
         feats = self.obs_encoder(obs_seq.reshape(B * W, D)).reshape(B, W, -1)  # [B,W,F]
         return feats
 
     def forward(self, obs_seq: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
-        # is_causal is unused here; for compatibility with TransformerEncoder
-        feats = self._encode_frames(obs_seq)       # [B,W,F]: batch, window, feat_dim
-        out, hT = self.gru(feats)  # out: [B,W,z], hT: [1,B,z]
+        feats = self._encode_frames(obs_seq)        # [B,W,F]
+        out, hT = self.gru(feats)                   # out: [B,W,z], hT: [1,B,z]
         
         if self.output_type == "last":
             return hT.squeeze(0)    # [B,z]
         elif self.output_type == "mean":
             return out.mean(dim=1)   # [B,z] 
         elif self.output_type == "attn":
-            attn_weights = torch.softmax(self.attn(out).squeeze(-1), dim=-1)  # [B,W]
-            z = (out * attn_weights.unsqueeze(-1)).sum(dim=1)                  # [B,z]
+            attn_weights = torch.softmax(self.attn(out).squeeze(-1), dim=-1)     # [B,W]
+            z = (out * attn_weights.unsqueeze(-1)).sum(dim=1)                    # [B,z]
             return z
         else:
             raise ValueError(f"Unknown output_type: {self.output_type}")
-
-# Causal Transformer Encoder (upgrade for SeqEncoder)
+        
 class TransformerEncoder(nn.Module):
     """ Transformer encoder for sequential data. """
     def __init__(self,
@@ -137,22 +134,6 @@ class TransformerEncoder(nn.Module):
 class BYOLSeq(nn.Module):
     """
     BYOL for sequential data (BYOL-Seq).
-
-    Args:
-        obs_encoder: ObsEncoder module to encode individual observations
-        z_dim:       Dimension of sequence representation
-        proj_dim:    Dimension of projection head output
-        tau:         EMA coefficient for target networks
-        output_type: How to pool GRU outputs ('last', 'mean', 'attn')
-        use_information_bottleneck: Whether to apply an information bottleneck on z
-
-    Notes:
-        output_type:
-            'last' - use final hidden state h_T
-            'mean' - average over all hidden states
-            'attn' - learnable attention over hidden states
-        use_information_bottleneck:
-            If True, applies an information bottleneck on the sequence representation z. Use re-parameterization trick.
     """
     def __init__(self,
                  obs_encoder: ObsEncoder,
@@ -160,7 +141,6 @@ class BYOLSeq(nn.Module):
                  proj_dim: int = 128,
                  tau: float = 0.996,
                  output_type: str = "mean",
-                 use_information_bottleneck: bool = False,
                  use_transformer: bool = False):
         super().__init__()
         if use_transformer:
@@ -169,13 +149,6 @@ class BYOLSeq(nn.Module):
             self.f_online = SeqEncoder(obs_encoder, z_dim=z_dim, output_type=output_type)
         self.g_online = mlp(z_dim, proj_dim)
         self.q_online = mlp(proj_dim, proj_dim)
-        self.use_information_bottleneck = bool(use_information_bottleneck)
-        if self.use_information_bottleneck:
-            self.ib_head = layer_init(nn.Linear(z_dim, 2 * z_dim), std=1.0)
-            self.beta_ib = 1e-3
-        else:
-            self.ib_head = None
-        self._last_ib_kl: Optional[torch.Tensor] = None
 
         import copy
         self.f_targ = copy.deepcopy(self.f_online)
@@ -185,92 +158,51 @@ class BYOLSeq(nn.Module):
 
         self.tau = float(tau)
 
-        # print full model summary
-        print("--------------------------------------------------")
-        print(f"[BYOLSeq] Initialized BYOLSeq model with:")
-        print(f"BYOLSeq: {self}")
-
     def train(self, mode: bool = True):
-        # Override to keep target networks in eval mode
         super().train(mode)
         self.f_targ.eval()
         self.g_targ.eval()
         return self
 
-    def infer_ctx(self,
-                  obs_seq: torch.Tensor) -> torch.Tensor:
-        """Encode context from observation sequence. obs_seq: [B,W,D_obs] -> [B,z_dim]"""
-        z = self.f_online(obs_seq)
-        if self.use_information_bottleneck:
-            z, _ = self._apply_information_bottleneck(z, sample=True)
-        return z
+    def infer_ctx(self, obs_seq: torch.Tensor) -> torch.Tensor:
+        """Infer context vector from observation sequence. obs_seq: [B,W,D_obs] -> [B,z_dim]"""
+        return self.f_online(obs_seq)
     
     @torch.no_grad()
     def ema_update(self) -> None:
-        """EMA update for target encoders."""
         for online, targ in ((self.f_online, self.f_targ), (self.g_online, self.g_targ)):
             for p_o, p_t in zip(online.parameters(), targ.parameters()):
                 p_t.data.mul_(self.tau).add_(p_o.data, alpha=1.0 - self.tau)
 
-    def _forward_pair(self,
-                      v1: torch.Tensor,
-                      v2: torch.Tensor):
-        # Online
+    def _forward_pair(self, v1: torch.Tensor, v2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         z1 = self.f_online(v1)          # [B, z]
         z2 = self.f_online(v2)
-        if self.use_information_bottleneck:
-            z1, kl1 = self._apply_information_bottleneck(z1, sample=False)
-            z2, kl2 = self._apply_information_bottleneck(z2, sample=False)
-            self._last_ib_kl = 0.5 * (kl1 + kl2)
-        else:
-            self._last_ib_kl = z1.new_zeros(())
         p1 = self.g_online(z1)          # [B, p]
         p2 = self.g_online(z2)
         h1 = self.q_online(p1)          # [B, p]
         h2 = self.q_online(p2)
-        
-        # Targets (no grad)
-        with torch.no_grad():
-            # Non-causal info flows into target networks. Use IB to limit excessive leakage.
-            z1t = self.f_targ(v1, is_causal=False)
-            z2t = self.f_targ(v2, is_causal=False)
-            if self.use_information_bottleneck:
-                z1t, _ = self._apply_information_bottleneck(z1t, sample=True) 
-                z2t, _ = self._apply_information_bottleneck(z2t, sample=True)
+    
+        with torch.no_grad():        # target path
+            z1t = self.f_targ(v1)
+            z2t = self.f_targ(v2)
             p1t = self.g_targ(z1t)
             p2t = self.g_targ(z2t)
         return h1, h2, p1t, p2t
 
-    def _apply_information_bottleneck(self, z: torch.Tensor, *, sample: bool) -> Tuple[torch.Tensor, torch.Tensor]:
-        if not self.use_information_bottleneck or self.ib_head is None:
-            return z, z.new_zeros(())
-        mu, logvar = self.ib_head(z).chunk(2, dim=-1)
-        if sample:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            z_sample = mu + std * eps
-            var = std.pow(2)
-            kl = 0.5 * (mu.pow(2) + var - logvar - 1.0).sum(dim=-1).mean()
-        else:
-            z_sample = mu
-            kl = mu.new_zeros(())
-        return z_sample, kl
-
-    def loss(self,
-             v1: torch.Tensor,
-             v2: torch.Tensor) -> torch.Tensor:
+    def loss(self, v1: torch.Tensor, v2: torch.Tensor) -> torch.Tensor:
         h1, h2, p1t, p2t = self._forward_pair(v1, v2)
         loss_12 = (l2norm(h1) - l2norm(p2t)).pow(2).sum(-1).mean()
         loss_21 = (l2norm(h2) - l2norm(p1t)).pow(2).sum(-1).mean()
-        loss = loss_12 + loss_21
-        if self.use_information_bottleneck and self._last_ib_kl is not None:
-            loss += self.beta_ib * self._last_ib_kl
-        return loss
+        return loss_12 + loss_21
+    
+    def loss_per_sample(self, v1: torch.Tensor, v2: torch.Tensor) -> torch.Tensor:
+        h1, h2, p1t, p2t = self._forward_pair(v1, v2)
+        loss_12 = (l2norm(h1) - l2norm(p2t)).pow(2).sum(-1)
+        loss_21 = (l2norm(h2) - l2norm(p1t)).pow(2).sum(-1)
+        return 0.5 * (loss_12 + loss_21)
 
     @torch.no_grad()
-    def mismatch_per_window(self,
-                            v1: torch.Tensor,
-                            v2: torch.Tensor) -> torch.Tensor:
+    def mismatch_per_window(self, v1: torch.Tensor, v2: torch.Tensor) -> torch.Tensor:
         h1, h2, p1t, p2t = self._forward_pair(v1, v2)
         m12 = (l2norm(h1) - l2norm(p2t)).pow(2).sum(-1)
         m21 = (l2norm(h2) - l2norm(p1t)).pow(2).sum(-1)
@@ -282,8 +214,6 @@ class BYOLSeq(nn.Module):
             + list(self.g_online.parameters())
             + list(self.q_online.parameters())
         )
-        if self.use_information_bottleneck and self.ib_head is not None:
-            params = list(self.ib_head.parameters()) + params
         if include_obs_encoder:
             params = list(self.f_online.obs_encoder.parameters()) + params
         return params
@@ -353,6 +283,43 @@ def extract_policy_obs_and_dones(storage) -> Tuple[torch.Tensor, torch.Tensor]:
     dones = dones.to(torch.bool)
     return obs, dones
 
+def extract_flat_obs_dict(storage, group_names: Iterable[str]) -> Dict[str, torch.Tensor]:
+    """Return {group: [T*N, D_g]} robustly, from storage.observations/obs."""
+    obs_container = getattr(storage, "observations", None)
+    if obs_container is None:
+        obs_container = getattr(storage, "obs", None)
+    if obs_container is None:
+        raise AttributeError("No observations found in storage.")
+    T = storage.num_transitions_per_env
+    N = storage.num_envs
+    out: Dict[str, torch.Tensor] = {}
+    def _pull(container, key):
+        v = None
+        if hasattr(container, "get"):
+            try: v = container.get(key)
+            except Exception: v = None
+        if v is None and isinstance(container, dict):
+            v = container.get(key)
+        return v
+    for g in group_names:
+        v = _pull(obs_container, g)
+        if v is None:
+            # try nested views
+            for parent in ("policy", "critic"):
+                parent_view = _pull(obs_container, parent)
+                if parent_view is None:
+                    continue
+                vv = _pull(parent_view, g)
+                if vv is None and isinstance(parent_view, dict) and g in parent_view:
+                    vv = parent_view[g]
+                if torch.is_tensor(vv):
+                    v = vv; break
+        if not torch.is_tensor(v):
+            raise KeyError(f"Cannot locate observation group '{g}' in storage.")
+        if v.dim() == 2:
+            v = v.unsqueeze(-1)
+        out[g] = v.flatten(0, 1)  # [T*N, D_g]
+    return out
 
 # ========================= Augmentations & Sampling =======================
 Index = Union[slice, List[int]]
@@ -366,11 +333,98 @@ class ObsGroup:
     cmd_vel: Optional[Index] = None
     joint_pos: Optional[Index] = None
     joint_vel: Optional[Index] = None
-    prev_actions: Optional[Index] = None     # joint position commands
+    prev_actions: Optional[Index] = None     
 
-    # if any
-    rpy: Optional[Index] = None
-    privilege_obs: Optional[Index] = None
+    # privilege_obs (not directly accessible to policy)
+    privilege_obs: Optional[Dict[str, Index]] = None
+
+UNITREE_GO2_ROUGH_OBS_GROUP = ObsGroup(
+    base_lin_vel=slice(0, 3),
+    base_ang_vel=slice(3, 6),
+    proj_gravity=slice(6, 9),
+    cmd_vel=slice(9, 12),
+    joint_pos=slice(12, 24),
+    joint_vel=slice(24, 36),
+    prev_actions=slice(36, 48),
+)
+
+@dataclass
+class PrivInfoGroup:
+    terrain_level: Optional[str] = "Curriculum/terrain_levels"
+    vel_error_xy: Optional[str] = "Metrics/base_velocity/error_vel_xy"
+    vel_error_yaw: Optional[str] = "Metrics/base_velocity/error_vel_yaw"
+    time_out: Optional[str] = "Episode_Termination/time_out"
+    base_contact: Optional[str] = "Episode_Termination/base_contact"
+
+def _extract_extra_value(extras: Dict, key: str):
+    """Fetch value from extras using either flat or hierarchical keys."""
+    if not isinstance(extras, dict):
+        return None
+    if key in extras:
+        return extras[key]
+    node = extras
+    for token in key.split("/"):
+        if isinstance(node, dict) and token in node:
+            node = node[token]
+        else:
+            return None
+    return node
+
+def _value_to_tensor(value, num_envs: int, device: torch.device) -> Optional[torch.Tensor]:
+    """Normalize scalars from extras into [N,1] tensors on the desired device."""
+    if isinstance(value, torch.Tensor):
+        data = value.to(device)
+    elif isinstance(value, (float, int)):
+        data = torch.full((num_envs,), float(value), device=device)
+    else:
+        return None
+    if data.dim() == 0:
+        data = data.expand(num_envs)
+    if data.shape[0] != num_envs:
+        data = data.reshape(num_envs, -1)
+        data = data[:, 0]
+    return data.view(num_envs, 1)
+
+
+class PrivInfoBuffer:
+    """Ring buffer that mirrors rollout storage for privileged per-step scalars."""
+    def __init__(self, group: PrivInfoGroup, horizon: int, num_envs: int, device: torch.device):
+        self.device = device
+        self.horizon = int(horizon)
+        self.num_envs = int(num_envs)
+        self.paths: Dict[str, str] = {}
+        self.buffers: Dict[str, torch.Tensor] = {}
+        for field in fields(PrivInfoGroup):
+            path = getattr(group, field.name)
+            if path is None:
+                continue
+            self.paths[field.name] = str(path)
+            self.buffers[field.name] = torch.zeros(self.horizon, self.num_envs, 1, device=device, dtype=torch.float32)
+        self.active = len(self.buffers) > 0
+
+    def record(self, step_idx: int, extras: Dict) -> None:
+        if not self.active:
+            return
+        if step_idx < 0 or step_idx >= self.horizon:
+            return
+        for name, key in self.paths.items():
+            value = _extract_extra_value(extras, key)
+            if value is None:
+                continue
+            data = _value_to_tensor(value, self.num_envs, self.device)
+            if data is None:
+                continue
+            self.buffers[name][step_idx].copy_(data)
+
+    def get(self, name: str) -> Optional[torch.Tensor]:
+        return self.buffers.get(name)
+
+    def zero_(self) -> None:
+        for buf in self.buffers.values():
+            buf.zero_()
+    
+    def get_all(self) -> Dict[str, torch.Tensor]:
+        return {name: buf.clone() for name, buf in self.buffers.items()}
 
 def _as_view(x: torch.Tensor, idx: Optional[Index]) -> torch.Tensor:
     return x if idx is None else x[..., idx]
@@ -389,7 +443,7 @@ def _yaw2Rot(theta: torch.Tensor) -> torch.Tensor:
 def _apply_yaw_rot_inplace(x: torch.Tensor, obs_group: ObsGroup, yaw: torch.Tensor):
     R = _yaw2Rot(yaw)
     for g in ("base_lin_vel", "base_ang_vel", "cmd_vel", "proj_gravity"):
-        idx = getattr(ObsGroup, g)
+        idx = getattr(obs_group, g)
         v = _as_view(x, idx)
         if v is None:
             continue
@@ -404,7 +458,10 @@ def _sim_slip_inplace(x: torch.Tensor, obs_group: ObsGroup, scale_xy: torch.Tens
     v = _as_view(x, obs_group.base_lin_vel)
     if v is None or v.shape[-1] < 2:
         return
-    v[..., 0:2] *= scale_xy # [B,1] boradcast across W
+    scale = scale_xy
+    while scale.dim() < v.dim():
+        scale = scale.unsqueeze(-1)
+    v[..., 0:2] *= scale  # broadcast along window/time dims
 
 def _sim_imu_drift_inplace(x: torch.Tensor, obs_group: ObsGroup, bias_lin: torch.Tensor, bias_ang: torch.Tensor):
     # Bias over the windows on imu channels
@@ -459,10 +516,17 @@ def _rand_gen(shape: Tuple[int, ...], device: torch.device, rng: torch.Generator
     except TypeError:
         return torch.rand(shape, device=device)
 
+def _randn_like(x: torch.Tensor, rng: torch.Generator) -> torch.Tensor:
+    try:
+        return torch.randn_like(x, generator=rng)
+    except TypeError:
+        return torch.randn(x.shape, device=x.device, dtype=x.dtype)
+
 def _feature_jitter(x: torch.Tensor, noise_std: float, feat_drop: float, rng: torch.Generator) -> None:
     """In-place: Gaussian noise + Bernoulli feature dropout per frame. x: [B,W,D]"""
     if noise_std > 0:
-        x.add_(_randn_like_gen(x, rng) * noise_std)
+        noise = _randn_like(x, rng) * noise_std
+        x.add_(noise)
     if feat_drop > 0:
         drop = _rand_gen(x.shape, x.device, rng) < feat_drop
         x.mul_(1.0 - drop.float())
@@ -521,22 +585,23 @@ def sample_byol_windows_phy(
     obs: torch.Tensor,                 # [T,N,D_obs]
     dones: torch.Tensor,               # [T,N]
     W: int, B: int,
-    obs_group: ObsGroup,
+    obs_group: Optional[ObsGroup] = UNITREE_GO2_ROUGH_OBS_GROUP,
     # general augmentations
-    delay: int,
-    gaussian_jitter_std: float,
-    frame_drop: float,
+    delay: int = 0,
+    gaussian_jitter_std: float = 0.0,
+    frame_drop: float = 0.0,
     # physics-informed augmentations
     yaw_rot_max: float = math.radians(10.0),
-    imu_drift_lin_std: float = 0.01,
-    imu_drift_ang_std: float = 0.01,
+    imu_drift_lin_std: float = 0.02,
+    imu_drift_ang_std: float = 0.02,
     slip_lin_scale_range: Tuple[float,float] = (0.7, 1.0),
     joint_gain_std: float = 0.01,
     joint_deadzone: float = 0.0,
     joint_pos_step: float = 0.0,
-    sensor_spike_prob: float = 0.01,
+    sensor_spike_prob: float = 0.05,
     sensor_spike_mag: float = 0.05,
     device: torch.device = torch.device("cpu"),
+    priv: Optional["PrivInfoBuffer"] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[int,int]], int]:
     """
     Sample B window pairs (v1, v2) with independent augs.
@@ -550,6 +615,7 @@ def sample_byol_windows_phy(
     picks = starts[idx].tolist()
 
     v1o, v2o = [], []
+    env_ids, starts_v1, starts_v2 = [], [], []
     T_total = obs.shape[0]
     for (s, n) in picks:
         w1o = obs[s : s + W_use, n, :].clone()
@@ -557,6 +623,9 @@ def sample_byol_windows_phy(
         s2 = max(0, min(s + delta, T_total - W_use))
         w2o = obs[s2 : s2 + W_use, n, :].clone()
         v1o.append(w1o); v2o.append(w2o)
+        env_ids.append(n)
+        starts_v1.append(s)
+        starts_v2.append(s2)
     v1o = torch.stack(v1o, dim=0).to(device)  # [B,W_use,D_obs]
     v2o = torch.stack(v2o, dim=0).to(device)
 
@@ -570,108 +639,151 @@ def sample_byol_windows_phy(
     _frame_drop_inplace(v1o, frame_drop, g1)
     _frame_drop_inplace(v2o, frame_drop, g2)
 
-    # physics-informed augmentations
-    def _apply_physics(vx, rng):
-        B, W, D = vx.shape
-        # sample window-wise random variables
-        yaw = (torch.rand((B,1), generator=rng, device=device) * 2 - 1) * yaw_rot_max
-        fxy = torch.empty((B,1), device=device).uniform_(*slip_lin_scale_range)
-        b_lin = torch.randn((B,1,3), generator=rng, device=device) * imu_drift_lin_std
-        b_ang = torch.randn((B,1,3), generator=rng, device=device) * imu_drift_ang_std
+    def _gather_priv_windows(starts: List[int]) -> Dict[str, torch.Tensor]:
+        if priv is None or not getattr(priv, "active", False) or len(starts) == 0:
+            return {}
+        data: Dict[str, torch.Tensor] = {}
+        for name, buf in priv.buffers.items():
+            windows = []
+            for env, s in zip(env_ids, starts):
+                window = buf[s : s + W_use, env, :]  # [W_use,1]
+                windows.append(window)
+            data[name] = torch.stack(windows, dim=0).to(device)
+        return data
 
-        _apply_yaw_rot_inplace(vx, obs_group, yaw)
-        _sim_slip_inplace(vx, obs_group, fxy)
-        _sim_imu_drift_inplace(vx, obs_group, b_lin, b_ang)
-        _per_leg_calibration_inplace(vx, obs_group, joint_gain_std, rng)
-        _sim_deadzone_inplace(vx, obs_group, joint_deadzone, joint_pos_step)
-        _sim_sensor_spike_inplace(vx, obs_group, sensor_spike_prob, sensor_spike_mag, rng)
-    
-    _apply_physics(v1o, g1)
-    _apply_physics(v2o, g2)
+    priv_v1 = _gather_priv_windows(starts_v1)
+    priv_v2 = _gather_priv_windows(starts_v2)
+
+    def _apply_physics(vx: torch.Tensor, rng: torch.Generator, priv_windows: Dict[str, torch.Tensor]) -> None:
+        if obs_group is None:
+            return
+        B, W, _ = vx.shape
+        dev = vx.device
+
+        def _priv_strength(name: str) -> Optional[torch.Tensor]:
+            buf = priv_windows.get(name)
+            if buf is None:
+                return None
+            return torch.tanh(buf.mean(dim=1)).to(device=dev, dtype=vx.dtype)
+
+        terrain = _priv_strength("terrain_level")
+        vel_xy = _priv_strength("vel_error_xy")
+        vel_yaw = _priv_strength("vel_error_yaw")
+        timeout = _priv_strength("time_out")
+        base_contact = _priv_strength("base_contact")
+
+        # yaw perturbation follows yaw tracking error / terrain difficulty
+        if yaw_rot_max > 0:
+            yaw_scale = torch.full((B, 1), yaw_rot_max, device=dev, dtype=vx.dtype)
+            if vel_yaw is not None:
+                yaw_scale *= (0.4 + 0.6 * vel_yaw.abs().clamp_max(1.0))
+            elif terrain is not None:
+                yaw_scale *= (0.6 + 0.4 * terrain.abs().clamp_max(1.0))
+            yaw_noise = (_rand_gen((B, 1), dev, rng) * 2.0 - 1.0) * yaw_scale  # [B,1]
+            yaw = yaw_noise.expand(-1, W)
+            _apply_yaw_rot_inplace(vx, obs_group, yaw)
+
+        # slope-aware gravity tilt informed by terrain difficulty & impacts
+        g_slice = _as_view(vx, obs_group.proj_gravity) if obs_group.proj_gravity is not None else None
+        if g_slice is not None and g_slice.shape[-1] >= 2:
+            tilt_ctrl = torch.zeros((B, 1), device=dev, dtype=vx.dtype)
+            if terrain is not None:
+                tilt_ctrl += terrain.relu().clamp_max(1.0)
+            if base_contact is not None:
+                tilt_ctrl += base_contact.relu().clamp_max(1.0)
+            tilt_ctrl = torch.clamp(tilt_ctrl, 0.0, 1.0)
+            if torch.any(tilt_ctrl > 0):
+                tilt_scale = (0.01 + 0.04 * tilt_ctrl).unsqueeze(1)  # [B,1,1]
+                tilt_noise = _randn_like(vx.new_zeros(B, W, 2), rng) * tilt_scale
+                g_slice[..., :2] += tilt_noise
+
+        # slip scaling informed by XY velocity tracking error / rough terrain
+        slip_min, slip_max = slip_lin_scale_range
+        slip_range = max(0.0, slip_max - slip_min)
+        if slip_range > 0:
+            slip_base = slip_min + slip_range * _rand_gen((B, 1), dev, rng)
+            slip_ctrl = torch.zeros_like(slip_base, dtype=vx.dtype)
+            if vel_xy is not None:
+                slip_ctrl += vel_xy.abs().clamp_max(1.0)
+            if terrain is not None:
+                slip_ctrl += terrain.relu().clamp_max(1.0)
+            slip_ctrl = torch.clamp(slip_ctrl, 0.0, 1.0)
+            slip_scale = slip_base - (slip_base - slip_min) * slip_ctrl
+            _sim_slip_inplace(vx, obs_group, slip_scale.expand(-1, W))
+
+        # IMU drift driven by tracking errors / impending timeouts
+        if imu_drift_lin_std > 0 or imu_drift_ang_std > 0:
+            ctrl_lin = torch.ones((B, 1), device=dev, dtype=vx.dtype)
+            ctrl_ang = torch.ones((B, 1), device=dev, dtype=vx.dtype)
+            if vel_xy is not None:
+                ctrl_lin += 0.5 * vel_xy.abs().clamp_max(1.0)
+            if vel_yaw is not None:
+                ctrl_ang += 0.5 * vel_yaw.abs().clamp_max(1.0)
+            if timeout is not None:
+                ctrl_lin += 0.25 * timeout.relu().clamp_max(1.0)
+                ctrl_ang += 0.25 * timeout.relu().clamp_max(1.0)
+            bias_lin = _randn_like(vx.new_zeros(B, 1, 3), rng) * imu_drift_lin_std
+            bias_ang = _randn_like(vx.new_zeros(B, 1, 3), rng) * imu_drift_ang_std
+            bias_lin *= ctrl_lin.unsqueeze(-1)
+            bias_ang *= ctrl_ang.unsqueeze(-1)
+            _sim_imu_drift_inplace(vx, obs_group, bias_lin, bias_ang)
+
+        # More calibration noise once robot stability degrades
+        if joint_gain_std > 0:
+            gain_scale = 1.0
+            if base_contact is not None:
+                gain_scale += 0.5 * float(base_contact.abs().mean().item())
+            if timeout is not None:
+                gain_scale += 0.25 * float(timeout.relu().mean().item())
+            _per_leg_calibration_inplace(vx, obs_group, joint_gain_std * gain_scale, rng)
+
+        if joint_deadzone > 0 or joint_pos_step > 0:
+            _sim_deadzone_inplace(vx, obs_group, joint_deadzone, joint_pos_step)
+
+        # command dropout under poor tracking / timeouts
+        cmd_slice = _as_view(vx, obs_group.cmd_vel) if obs_group.cmd_vel is not None else None
+        if cmd_slice is not None:
+            drop_ctrl = torch.zeros((B, 1), device=dev, dtype=vx.dtype)
+            if timeout is not None:
+                drop_ctrl += timeout.relu().clamp_max(1.0)
+            if vel_xy is not None:
+                drop_ctrl += vel_xy.abs().clamp_max(1.0)
+            drop_prob = torch.clamp(0.05 + 0.25 * drop_ctrl, 0.0, 0.6)
+            if torch.any(drop_prob > 0):
+                drop_mask = (_rand_gen((B, W), dev, rng) < drop_prob).unsqueeze(-1)
+                cmd_slice.mul_(1.0 - drop_mask.to(dtype=cmd_slice.dtype))
+
+        # actuator stiction when impacts accumulate
+        stiction_ctrl = torch.zeros((B, 1), device=dev, dtype=vx.dtype)
+        if base_contact is not None:
+            stiction_ctrl += base_contact.relu().clamp_max(1.0)
+        if vel_xy is not None:
+            stiction_ctrl += 0.5 * vel_xy.abs().clamp_max(1.0)
+        stiction_scale = torch.clamp(1.0 - 0.4 * torch.clamp(stiction_ctrl, 0.0, 1.0), 0.2, 1.0)
+        if torch.any(stiction_scale < 1.0):
+            for name in ("joint_vel", "prev_actions"):
+                idx = getattr(obs_group, name)
+                v = _as_view(vx, idx)
+                if v is None:
+                    continue
+                scale = stiction_scale
+                while scale.dim() < v.dim():
+                    scale = scale.unsqueeze(-1)
+                v.mul_(scale)
+
+        if sensor_spike_prob > 0 and sensor_spike_mag > 0:
+            spike_prob = sensor_spike_prob
+            spike_mag = sensor_spike_mag
+            if base_contact is not None:
+                spike_prob *= float((1.0 + base_contact.abs().mean()).clamp(max=2.0).item())
+            if timeout is not None:
+                spike_prob *= float((1.0 + timeout.relu().mean()).clamp(max=2.0).item())
+            if vel_xy is not None:
+                spike_mag *= float((1.0 + vel_xy.abs().mean()).clamp(max=2.0).item())
+            spike_prob = min(spike_prob, 1.0)
+            _sim_sensor_spike_inplace(vx, obs_group, spike_prob, spike_mag, rng)
+
+    _apply_physics(v1o, g1, priv_v1)
+    _apply_physics(v2o, g2, priv_v2)
 
     return v1o, v2o, picks, len(picks)
-
-
-# @torch.no_grad()
-# def sample_byol_windows(
-#     obs: torch.Tensor,                 # [T,N,D_obs]
-#     dones: torch.Tensor,               # [T,N]
-#     W: int, B: int, max_shift: int,
-#     noise_std: float, feat_drop: float, frame_drop: float,
-#     time_warp_scale: float,
-#     # Extra augmentations (all optional; default disabled)
-#     ch_drop: float = 0.0,
-#     time_mask_prob: float = 0.0,
-#     time_mask_span: int = 0,
-#     gain_std: float = 0.0,
-#     bias_std: float = 0.0,
-#     smooth_prob: float = 0.0,
-#     smooth_kernel: int = 0,
-#     mix_strength: float = 0.0,
-#     device: torch.device = torch.device("cpu"),
-# ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[int,int]], int]:
-#     """
-#     Sample B window pairs (v1, v2) with independent augs.
-#     """
-#     W_use = min(int(W), int(obs.shape[0]))
-#     starts = _valid_window_starts(dones, W_use)
-#     if len(starts) == 0:
-#         starts = np.array([(0, n) for n in range(obs.shape[1])], dtype=np.int64)
-#     replace = len(starts) < B
-#     idx = np.random.choice(len(starts), size=min(B, len(starts)), replace=replace)
-#     picks = starts[idx].tolist()
-
-#     v1o, v2o = [], []
-#     T_total = obs.shape[0]
-#     for (s, n) in picks:
-#         w1o = obs[s : s + W_use, n, :].clone()
-#         delta = np.random.randint(-max_shift, max_shift + 1) if max_shift > 0 else 0
-#         s2 = max(0, min(s + delta, T_total - W_use))
-#         w2o = obs[s2 : s2 + W_use, n, :].clone()
-#         v1o.append(w1o); v2o.append(w2o)
-
-#     v1o = torch.stack(v1o, dim=0).to(device)  # [B,W_use,D_obs]
-#     v2o = torch.stack(v2o, dim=0).to(device)
-
-#     g1 = torch.Generator(device=device).manual_seed(torch.randint(0, 2**31 - 1, (1,)).item())
-#     g2 = torch.Generator(device=device).manual_seed(torch.randint(0, 2**31 - 1, (1,)).item())
-
-#     _feature_jitter(v1o, noise_std, feat_drop, g1)
-#     _feature_jitter(v2o, noise_std, feat_drop, g2)
-
-#     # calibration (per-channel gain/bias)
-#     _calibration_noise_inplace(v1o, gain_std, bias_std, g1)
-#     _calibration_noise_inplace(v2o, gain_std, bias_std, g2)
-
-#     # channel-consistent dropout
-#     _channel_dropout_inplace(v1o, ch_drop, g1)
-#     _channel_dropout_inplace(v2o, ch_drop, g2)
-
-#     # time-span masking
-#     _time_mask_inplace(v1o, time_mask_span, time_mask_prob, g1)
-#     _time_mask_inplace(v2o, time_mask_span, time_mask_prob, g2)
-
-#     # frame dropout (temporal consistency)
-#     _frame_drop_inplace(v1o, frame_drop, g1)
-#     _frame_drop_inplace(v2o, frame_drop, g2)
-
-#     if max_shift > 0:
-#         # random temporal shift (independent for v1 and v2)
-#         v1o = _temporal_shift(v1o, int(torch.randint(-max_shift, max_shift + 1, (1,)).item()))
-#         v2o = _temporal_shift(v2o, int(torch.randint(-max_shift, max_shift + 1, (1,)).item()))
-
-#     if time_warp_scale > 0:
-#         # time warp (independent for v1 and v2)
-#         v1o = _time_warp(v1o, time_warp_scale, g1)
-#         v2o = _time_warp(v2o, time_warp_scale, g2)
-
-#     if mix_strength > 0.0:
-#         # temporal mixing (independent for v1 and v2)
-#         v1o = _temporal_mixing(v1o, mix_strength, g1)
-#         v2o = _temporal_mixing(v2o, mix_strength, g2)
-
-#     # optional smoothing at the end
-#     _smooth_time_inplace(v1o, smooth_kernel, smooth_prob)
-#     _smooth_time_inplace(v2o, smooth_kernel, smooth_prob)
-
-#     return v1o, v2o, picks, len(picks)

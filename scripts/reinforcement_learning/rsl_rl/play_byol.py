@@ -40,7 +40,7 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
-# BYOL toggles (mirror train_byol.py)
+# BYOL toggles (mirror myrl.algorithms.train_byol)
 parser.add_argument("--no-byol", dest="use_byol", action="store_false", help="Disable BYOL defaults.")
 parser.set_defaults(use_byol=True)
 parser.add_argument("--byol_debug", action="store_true", default=False, help="Print effective BYOL/policy knobs.")
@@ -90,8 +90,8 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 
-from myrl.runner_BYOL import OnPolicyRunnerBYOL
-from myrl.rsl_cfg import PPObyolRunnerCfg
+from myrl.runners.byol import OnPolicyRunnerBYOL
+from myrl.config.rsl_cfg import PPObyolRunnerCfg
 
 
 def _overlay(cfg_1, cfg_2):

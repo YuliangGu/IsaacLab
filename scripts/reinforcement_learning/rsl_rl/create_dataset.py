@@ -10,7 +10,7 @@ Typical usage after training completes::
         --num-steps 20000
 
 The saved ``.pt`` file stores tensors shaped ``[T, N, ...]`` (time, envs, features),
-ready to be consumed by ``myrl.utils_core.sample_byol_windows`` for BYOL augmentation.
+ready to be consumed by ``myrl.utils.core.sample_byol_windows`` for BYOL augmentation.
 """
 
 from __future__ import annotations
