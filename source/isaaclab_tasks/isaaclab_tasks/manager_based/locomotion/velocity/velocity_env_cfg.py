@@ -258,9 +258,21 @@ class RewardsCfg:
         weight=-1.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*THIGH"), "threshold": 1.0},
     )
-    # -- optional penalties
+
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=0.0)
     dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=0.0)
+    
+    # NOTE: these rewards are NOT intended to contribute to the reward signal.
+    privileged_metrics = RewTerm(
+        func=mdp.log_privileged_metrics,
+        weight=1.0,
+        params={
+            "contact_sensor_cfg": SceneEntityCfg("contact_forces"),
+            "asset_cfg": SceneEntityCfg("robot"),
+            "height_sensor_cfg": SceneEntityCfg("height_scanner"),
+            "contact_force_threshold": 1.0,
+        },
+    )
 
 
 @configclass

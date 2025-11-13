@@ -128,6 +128,7 @@ class CurriculumTermCfg(ManagerTermBaseCfg):
     """Configuration for a curriculum term."""
 
     func: Callable[..., float | dict[str, float] | None] = MISSING
+
     """The name of the function to be called.
 
     This function should take the environment object, environment indices

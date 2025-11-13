@@ -293,6 +293,7 @@ def contact_forces(env: ManagerBasedRLEnv, threshold: float, sensor_cfg: SceneEn
 Velocity-tracking rewards.
 """
 
+""" NOTE: these rewards are added to privileged info for BYOL use."""
 
 def track_lin_vel_xy_exp(
     env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
@@ -305,6 +306,7 @@ def track_lin_vel_xy_exp(
         torch.square(env.command_manager.get_command(command_name)[:, :2] - asset.data.root_lin_vel_b[:, :2]),
         dim=1,
     )
+    env.extras.setdefault("privileged", {})["vel_error_xy"] = torch.sqrt(lin_vel_error + 1e-9).unsqueeze(-1).detach()
     return torch.exp(-lin_vel_error / std**2)
 
 
@@ -316,4 +318,5 @@ def track_ang_vel_z_exp(
     asset: RigidObject = env.scene[asset_cfg.name]
     # compute the error
     ang_vel_error = torch.square(env.command_manager.get_command(command_name)[:, 2] - asset.data.root_ang_vel_b[:, 2])
+    env.extras.setdefault("privileged", {})["vel_error_yaw"] = torch.sqrt(ang_vel_error + 1e-9).unsqueeze(-1).detach()
     return torch.exp(-ang_vel_error / std**2)

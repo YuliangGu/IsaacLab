@@ -35,23 +35,23 @@ class UnitreeGo2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         # """ turn off curriculum """
         # self.curriculum.terrain_levels = None
 
-        """ Turn on/off "privileged" observations """
+        """ Turn on/off "privileged" observations to the policy """
         self.observations.policy.height_scan = None
         self.actions.joint_pos.scale = 0.25 # This is default. 
 
         """ Events: all happen at reset time """
         # randomize the base mass of the robot
         self.events.add_base_mass.mode = "startup" #try "reset"
-        self.events.add_base_mass.params["mass_distribution_params"] = (-2.0, 2.0) #default (-2.0, 2.0)
-        self.events.add_base_mass.params["operation"] = "add" #default "add"
+        self.events.add_base_mass.params["mass_distribution_params"] = (0.5, 1.5) #default (-2.0, 2.0)
+        self.events.add_base_mass.params["operation"] = "scale" #default "add"
         self.events.add_base_mass.params["distribution"] = "uniform" #default "uniform"
         self.events.add_base_mass.params["asset_cfg"].body_names = "base"
 
         # randomize friction of the terrain
         self.events.physics_material.mode = "startup" #try "reset"
-        self.events.physics_material.params["static_friction_range"] = (0.8, 0.8) #default (0.8, 0.8)
-        self.events.physics_material.params["dynamic_friction_range"] = (0.6, 0.6) #default (0.6, 0.6)
-        self.events.physics_material.params["num_buckets"] = 64 #default 64
+        self.events.physics_material.params["static_friction_range"] = (0.6, 1.0) #default (0.8, 0.8)
+        self.events.physics_material.params["dynamic_friction_range"] = (0.4, 0.8) #default (0.6, 0.6)
+        self.events.physics_material.params["num_buckets"] = 64 # default 64
         self.events.physics_material.params["asset_cfg"].body_names = ".*_foot" # only randomize feet friction
 
         # randomize CoM of the base
@@ -59,8 +59,8 @@ class UnitreeGo2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
 
         # push the robot randomly
         self.events.base_external_force_torque.mode = "reset"
-        self.events.base_external_force_torque.params["force_range"] = (0.0, 0.0) #default (0.0, 0.0)
-        self.events.base_external_force_torque.params["torque_range"] = (0.0, 0.0)
+        self.events.base_external_force_torque.params["force_range"] = (-10.0, 10.0)
+        self.events.base_external_force_torque.params["torque_range"] = (-5.0, 5.0)
 
         # reset robot 
         self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)

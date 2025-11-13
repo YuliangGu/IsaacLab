@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.envs import mdp
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.sensors import ContactSensor
+from isaaclab.sensors import ContactSensor, RayCaster
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
 if TYPE_CHECKING:
@@ -114,3 +114,71 @@ def stand_still_joint_deviation_l1(
     command = env.command_manager.get_command(command_name)
     # Penalize motion when command is nearly zero.
     return mdp.joint_deviation_l1(env, asset_cfg) * (torch.norm(command[:, :2], dim=1) < command_threshold)
+
+
+def log_privileged_metrics(
+    env: ManagerBasedRLEnv,
+    contact_sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    height_sensor_cfg: SceneEntityCfg | None = None,
+    contact_force_threshold: float = 1.0,
+) -> torch.Tensor:
+    """Emit privileged metrics into ``env.extras``."""
+    # NOTE (IMPORTANT): This reward term does NOT contribute to the reward signal.
+    privileged = env.extras.setdefault("privileged", {})
+
+    # Slip intensity from tangential foot speed while in contact.
+    contact_sensor: ContactSensor = env.scene.sensors[contact_sensor_cfg.name]
+    asset = env.scene[asset_cfg.name]
+    cfg_body_ids = contact_sensor_cfg.body_ids
+    if isinstance(cfg_body_ids, slice):
+        body_indices = cfg_body_ids
+    elif cfg_body_ids is not None:
+        if torch.is_tensor(cfg_body_ids):
+            body_indices = cfg_body_ids.to(device=env.device, dtype=torch.long)
+        else:
+            body_indices = torch.as_tensor(cfg_body_ids, device=env.device, dtype=torch.long)
+    else:
+        inferred = [i for i, name in enumerate(contact_sensor.body_names) if "foot" in name.lower()]
+        if inferred:
+            body_indices = torch.as_tensor(inferred, device=env.device, dtype=torch.long)
+        else:
+            body_indices = slice(None)
+
+    def _gather(data: torch.Tensor, idx):
+        if isinstance(idx, slice):
+            return data[:, idx]
+        return data.index_select(1, idx)
+
+    forces = _gather(contact_sensor.data.net_forces_w, body_indices)
+    contact_mask = forces.norm(dim=-1) > contact_force_threshold
+    foot_vel = _gather(asset.data.body_lin_vel_w, body_indices)[..., :2]
+    tangential_speed = foot_vel.norm(dim=-1)
+    contact_count = contact_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+    slip_metric = (tangential_speed * contact_mask.float()).sum(dim=1, keepdim=True) / contact_count
+    privileged["contact_slip"] = slip_metric.detach()
+
+    # Torque RMS
+    joint_ids = asset_cfg.joint_ids if asset_cfg.joint_ids is not None else slice(None)
+    joint_torque = asset.data.applied_torque[:, joint_ids]
+    torque_rms = torch.sqrt(torch.mean(joint_torque.pow(2), dim=1, keepdim=True) + 1e-9)
+    privileged["torque_rms"] = torque_rms.detach()
+
+    # Terrain roughness from height scanner variance.
+    terrain_metric = None
+    if height_sensor_cfg is not None and height_sensor_cfg.name in env.scene.sensors:
+        height_sensor: RayCaster = env.scene.sensors[height_sensor_cfg.name]
+        if hasattr(height_sensor.data, "ray_hits_w"):
+            heights = height_sensor.data.ray_hits_w[..., 2]
+            valid = torch.isfinite(heights)
+            masked = torch.where(valid, heights, torch.zeros_like(heights))
+            denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+            mean = masked.sum(dim=1, keepdim=True) / denom
+            variance = ((masked - mean) ** 2 * valid).sum(dim=1, keepdim=True) / denom
+            terrain_metric = torch.sqrt(variance + 1e-9)
+    if terrain_metric is None:
+        terrain_metric = torch.zeros_like(slip_metric)
+    privileged["terrain_roughness"] = terrain_metric.detach()
+
+    # Return zeros so the reward signal is untouched.
+    return torch.zeros(env.num_envs, device=env.device)
