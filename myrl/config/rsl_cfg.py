@@ -20,8 +20,6 @@ class PPObyolRunnerCfg(RslRlOnPolicyRunnerCfg):
         # default ActorCritic hparams
 
         # BYOL extras
-        rpo_actor: bool = False
-        rpo_alpha: float = 0.3
         ctx_mode: str = "film"  # 'film'|'concat'|'none'
         ctx_dim: int = 64          # Must match algorithm.byol_z_dim
         feat_dim: int = 256        # ObsEncoder output dim
@@ -31,22 +29,23 @@ class PPObyolRunnerCfg(RslRlOnPolicyRunnerCfg):
 
         # BYOL knobs (forwarded to PPOWithBYOL.__init__)
         enable_byol: bool = True
-        share_byol_encoder: bool = True
-        byol_lambda: float = 0.1
-        byol_window: int = 16
+        share_byol_encoder: bool = False
+
+        # BYOL hyperparameters
+        byol_lambda: float = 0.2
+        byol_window: int = 24
         byol_batch: int = -1
-        use_transformer: bool = False
-        byol_tau_start: float = 0.98
-        byol_tau_end: float = 0.998
+        byol_tau_start: float = 0.99
+        byol_tau_end: float = 0.9995
         byol_z_dim: int = 64                        # Must match policy.ctx_dim
         byol_proj_dim: int = 128
         byol_update_proportion: float = 0.5
-        byol_intrinsic_coef: float = 0.05
+        byol_replay_iters: int = 4
 
         # BYOL augmentations
         byol_delay: int = 2
         byol_gaussian_jitter_std: float = 0.05
         byol_frame_drop: float = 0.1
 
-        # Aggregator for BYOL context: 'last' | 'mean' | 'attn'
+        # Aggregator for BYOL context: 'last' | 'mean'
         byol_ctx_agg: str = "mean"

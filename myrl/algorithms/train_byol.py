@@ -119,13 +119,6 @@ torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
-
-""" 
-    Allow a lightweight alias for our BYOL agent cfg without touching Hydra registry.
-        * If user passes --agent=myrl_byol, we ask Hydra to load the standard entry (so it doesn't fail),
-        * then inside main() we replace agent_cfg with PPObyolRunnerCfg().
-"""
-
 def _overlay(cfg_1, cfg_2):
     """overlay cfg_2 on top of cfg_1. Dont overwrite existing fields in cfg_1."""
     d1 = cfg_1.to_dict()
@@ -211,12 +204,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg.algorithm = _overlay(PPObyolRunnerCfg.algorithm(), agent_cfg.algorithm)
         agent_cfg.class_name = "OnPolicyRunnerBYOL"
         agent_cfg.policy.class_name = "ActorCriticAug"
-        agent_cfg.policy.actor_obs_normalization = True
-        agent_cfg.policy.critic_obs_normalization = True
+        agent_cfg.policy.activation = "elu"
+        agent_cfg.policy.init_noise_std = 1.0
+        agent_cfg.policy.actor_obs_normalization = False
+        agent_cfg.policy.critic_obs_normalization = False
         agent_cfg.policy.noise_std_type = "log"
         agent_cfg.algorithm.class_name = "PPOWithBYOL"
-        agent_cfg.algorithm.desired_kl = 0.015 # default was 0.01
-        agent_cfg.algorithm.normalize_advantage_per_mini_batch = True
+        agent_cfg.algorithm.desired_kl = 0.01 
+        agent_cfg.algorithm.normalize_advantage_per_mini_batch = False
 
         if args_cli.byol_debug:
             print("[BYOL DEBUG] Effective agent config after BYOL overlay:")

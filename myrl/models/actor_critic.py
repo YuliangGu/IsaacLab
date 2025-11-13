@@ -177,8 +177,6 @@ class ActorCriticAug(ActorCritic):
     A lightweight ActorCritic with shared encoder and optional context conditioning.
     """
     def __init__(self, *base_args,
-                 rpo_actor: bool = False,
-                 rpo_alpha: float = 0.5,
                  ctx_mode: str = "concat",      # 'none'|'concat'|'film'
                  ctx_dim: int = 32,
                  feat_dim: Optional[int] = 128,  # ObsEncoder output dim; defaults to obs dim
@@ -197,11 +195,6 @@ class ActorCriticAug(ActorCritic):
         else:
             init_noise_std = float(init_noise_std)
         self._init_noise_std = init_noise_std
-
-        self.rpo_actor = bool(rpo_actor)
-        self.rpo_alpha = float(rpo_alpha)
-        if self.rpo_alpha < 0.0:
-            raise ValueError(f"rpo_alpha must be non-negative, got {self.rpo_alpha}.")
 
         self._feat_dim = feat_dim
 
@@ -235,7 +228,7 @@ class ActorCriticAug(ActorCritic):
         self._ctx: Optional[torch.Tensor] = None
 
     def _actor_distribution_from_features(
-        self, features: torch.Tensor, apply_rpo: bool
+        self, features: torch.Tensor, apply_rpo: bool = False
     ) -> Normal:
         """Builds the action distribution from encoded features."""
         mean = self.actor(features)
@@ -248,10 +241,9 @@ class ActorCriticAug(ActorCritic):
                 f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'"
             )
 
-        if apply_rpo and self.rpo_actor and self.training:
-            noise = torch.empty_like(mean).uniform_(-self.rpo_alpha, self.rpo_alpha)
-            mean = mean + noise
-
+        if apply_rpo:
+            z = (2.0 * torch.rand_like(mean) - 1.0) * 0.1  # RPO noise
+            mean = mean + z
         return Normal(mean, std)
 
     def _features(self, x: torch.Tensor, c: torch.Tensor | None) -> torch.Tensor:
@@ -263,12 +255,10 @@ class ActorCriticAug(ActorCritic):
         return z
 
     def get_actor_obs_raw(self, obs):
-        base = super().get_actor_obs(obs) 
-        return base
+        return super().get_actor_obs(obs)
 
     def get_critic_obs_raw(self, obs):
-        base = super().get_critic_obs(obs)
-        return base
+        return super().get_critic_obs(obs)
 
     # --- rsl-rl observation hooks ---
     def get_actor_obs(self, obs):
@@ -281,18 +271,16 @@ class ActorCriticAug(ActorCritic):
         c = self._ctx
         return self._features(base, c)
     
-    def update_distribution(self, obs, apply_rpo: Optional[bool] = None):
+    def update_distribution(self, obs, apply_rpo: bool = False):
         """Update action distribution using encoded (and normalized) observations."""
-        if apply_rpo is None:
-            apply_rpo = self.rpo_actor
         dist = self._actor_distribution_from_features(obs, apply_rpo)
         self.distribution = dist
-        return dist
+        return dist 
 
-    def act(self, obs, **kwargs):
+    def act(self, obs, apply_rpo: bool = False, **kwargs):
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
-        self.update_distribution(obs)
+        self.update_distribution(obs, apply_rpo=apply_rpo)
         return self.distribution.sample()
 
     # --- normalization updates (only on raw obs) ---

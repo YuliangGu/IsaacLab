@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import deque
+
 import numpy as np
 
 import torch
@@ -16,6 +18,7 @@ from myrl.utils.core import (
     PrivInfoGroup,
     PrivInfoBuffer,
     extract_flat_obs_dict,
+    grad_reverse,
 )
 from myrl.models import ActorCriticAug
 
@@ -26,7 +29,6 @@ class PPOWithBYOL(PPO):
             # BYOL enable/disable
             enable_byol: bool = True,
             share_byol_encoder: bool = True,
-            use_transformer: bool = False,
             
             # BYOL hyperparameters
             byol_lambda: float = 0.2,           
@@ -37,21 +39,23 @@ class PPOWithBYOL(PPO):
             byol_z_dim: int = 64,
             byol_proj_dim: int = 128,
             byol_update_proportion: float = 0.5,
-            byol_intrinsic_coef: float = 0.01,
+            byol_replay_iters: int = 3,
 
             # BYOL augmentations
             byol_delay: int = 2,
             byol_gaussian_jitter_std: float = 0.05,
             byol_frame_drop: float = 0.1,
-
             byol_ctx_agg: str = "mean",
             priv_info_group: PrivInfoGroup = PrivInfoGroup(),
+
             # PPO kwargs (e.g., device, lr, clips)
+            rpo_rollout: bool = False,
             **ppo_kwargs,
         ):
         total_iters_kwarg = ppo_kwargs.pop("total_num_iters", None)
         # forward standard PPO kwargs to base class
         super().__init__(policy, **ppo_kwargs)
+        self.rpo_rollout = rpo_rollout
 
         # BYOL enable/disable flag
         self.enable_byol = bool(enable_byol)
@@ -71,7 +75,7 @@ class PPOWithBYOL(PPO):
         self.byol_z_dim = byol_z_dim
         self.byol_proj_dim = byol_proj_dim
         self.byol_update_proportion = byol_update_proportion
-        self.byol_intrinsic_coef = float(byol_intrinsic_coef)
+        self.byol_replay_iters = max(0, int(byol_replay_iters))
 
         # BYOL augmentations
         self.byol_delay = byol_delay
@@ -96,7 +100,6 @@ class PPOWithBYOL(PPO):
                 proj_dim=self.byol_proj_dim,
                 tau=self.byol_tau_start,
                 output_type=self.byol_ctx_agg,
-                use_transformer=bool(use_transformer),
             ).to(self.device)
 
             # ctx compatibility check
@@ -145,18 +148,27 @@ class PPOWithBYOL(PPO):
         self._base_policy_lr = self.learning_rate
         self.param_to_clip = enc + heads + byol_params
         
-
         # lazy init
         self.debug_ = True
         self.ctx_h = None
         self.ctx_buf = None
         self.cnts = 0
-        self._last_intrinsic_bonus = 0.0
         self._last_logged_mismatch = None
+        self._byol_replay = deque(maxlen=self.byol_replay_iters) if self.byol_replay_iters > 0 else None
         total_iters = total_iters_kwarg
         if total_iters is None or total_iters <= 0:
             total_iters = 1000
         self.total_num_iters = max(1, int(total_iters))
+
+        # EXPERIMENTAL: gradient reversal layer for curriculum levels
+        self._experimental = True
+        if self._experimental and self.enable_byol:
+            self._domain_predictor = nn.Sequential(nn.Linear(self.byol_z_dim, 64), nn.ReLU(), nn.Linear(64, 1)).to(self.device)
+            self.optimizer.add_param_group({"params": self._domain_predictor.parameters(), "lr": self.learning_rate, "tag": "domain"})
+            self.param_to_clip += list(self._domain_predictor.parameters())
+            print("Optimizer param groups:")
+            for i, group in enumerate(self.optimizer.param_groups):
+                print(f"  Group {i}: {len(group['params'])} params, lr={group['lr']}, tag={group.get('tag', 'N/A')}")
 
     def _zero_ctx(self):
         if not self.enable_byol:
@@ -167,6 +179,69 @@ class PPOWithBYOL(PPO):
             self._obs_win.zero_()
         if hasattr(self, "_win_idx"):
             self._win_idx = 0
+
+    def _snapshot_priv_buffers(self) -> dict[str, torch.Tensor] | None:
+        if self._priv_info_buffer is None or not getattr(self._priv_info_buffer, "active", False):
+            return None
+        data = self._priv_info_buffer.get_all()
+        if not data:
+            return None
+        return {name: buf.detach().cpu() for name, buf in data.items()}
+
+    def _append_byol_replay(self, obs_raw: torch.Tensor, dones_raw: torch.Tensor) -> None:
+        if self._byol_replay is None:
+            return
+        entry = {
+            "obs": obs_raw.detach().cpu(),
+            "dones": dones_raw.detach().cpu(),
+            "priv": self._snapshot_priv_buffers(),
+        }
+        self._byol_replay.append(entry)
+
+    def _combine_priv_snapshots(
+        self, snapshots: list[dict[str, torch.Tensor] | None]
+    ) -> object | None:
+        snaps = [snap for snap in snapshots if snap]
+        if len(snaps) != len(snapshots) or not snaps:
+            return None
+        keys = snaps[0].keys()
+        for snap in snaps[1:]:
+            if snap.keys() != keys:
+                return None
+        buffers = {name: torch.cat([snap[name] for snap in snaps], dim=0) for name in keys}
+        if not buffers:
+            return None
+
+        class _PrivReplayView:
+            __slots__ = ("buffers", "active")
+
+            def __init__(self, buf_dict):
+                self.buffers = buf_dict
+                self.active = True
+
+        return _PrivReplayView(buffers)
+
+    def _prepare_byol_corpus(
+        self, obs_raw: torch.Tensor, dones_raw: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, object | None]:
+        if self._byol_replay is None or len(self._byol_replay) == 0:
+            return obs_raw, dones_raw, self._priv_info_buffer
+
+        entries = list(self._byol_replay)
+        entries.append(
+            {
+                "obs": obs_raw.detach().cpu(),
+                "dones": dones_raw.detach().cpu(),
+                "priv": self._snapshot_priv_buffers(),
+            }
+        )
+
+        device_obs = obs_raw.device
+        device_dones = dones_raw.device
+        obs_cat = torch.cat([entry["obs"] for entry in entries], dim=0).to(device=device_obs)
+        dones_cat = torch.cat([entry["dones"] for entry in entries], dim=0).to(device=device_dones)
+        priv_view = self._combine_priv_snapshots([entry["priv"] for entry in entries])
+        return obs_cat, dones_cat, priv_view
 
     def init_storage(self, *args, **kwargs):
         super(PPOWithBYOL, self).init_storage(*args, **kwargs)
@@ -210,7 +285,6 @@ class PPOWithBYOL(PPO):
         self.transition.clear()
         self.policy.reset(dones)   
 
-        # BYOL context reset on done
         d = dones.squeeze(-1).to(torch.bool)                            
         to = extras.get("time_outs", None)                              
         if to is not None:
@@ -227,11 +301,9 @@ class PPOWithBYOL(PPO):
             self.ctx_buf[self.storage.step] = ct
             self.policy.set_belief(ct)
 
-        self.transition.actions = self.policy.act(obs).detach()
+        self.transition.actions = self.policy.act(obs, apply_rpo=self.rpo_rollout).detach() # apply RPO if enabled
         self.transition.values = self.policy.evaluate(obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
-        # self.transition.action_mean = self.policy.action_mean.detach()
-        # self.transition.action_sigma = self.policy.action_std.detach()
         self.transition.mu = self.policy.action_mean.detach()
         self.transition.sigma = self.policy.action_std.detach()
         self.transition.action_mean = self.transition.mu
@@ -241,7 +313,7 @@ class PPOWithBYOL(PPO):
         return self.transition.actions
 
     def _infer(self, obs):
-        """ Infer latent context. Used during rollout to update GRU state."""
+        """ Infer latent context."""
         base = self.policy.get_actor_obs_raw(obs)  # [N, obs_dim]
         N = base.shape[0]
         W = int(self.byol_window)
@@ -258,16 +330,9 @@ class PPOWithBYOL(PPO):
         return c_t
 
     def compute_returns(self, obs):
-        # overriden to infer context for last step before bootstrapping value
         if self.enable_byol:
             ct = self._infer(obs)            # infer belief before sampling. shape: [num_envs, z_dim]
             self.policy.set_belief(ct)
-        if self.enable_byol and self.byol_intrinsic_coef > 0.0:
-            obs_raw, dones_raw = extract_policy_obs_and_dones(self.storage)
-            self._last_intrinsic_bonus = self._apply_intrinsic_rewards(obs_raw, dones_raw) # in-place modify rewards
-        else:
-            self._last_intrinsic_bonus = 0.0
-
         last_values = self.policy.evaluate(obs).detach()
         self.storage.compute_returns(
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
@@ -279,14 +344,21 @@ class PPOWithBYOL(PPO):
         
         self.policy.train()
         curr_byol_lambda = self.byol_lambda
+        byol_obs_corpus = None
+        byol_dones_corpus = None
+        byol_priv_corpus = None
         if self.enable_byol and self.byol is not None:
             self.byol.train() 
             if self.byol_tau_start != self.byol_tau_end:
                 p = self.cnts / float(self.total_num_iters)
                 self.byol.tau = self.byol_tau_start + p * (self.byol_tau_end - self.byol_tau_start)
-            obs_raw, dones_raw = extract_policy_obs_and_dones(self.storage) 
+            obs_raw, dones_raw = extract_policy_obs_and_dones(self.storage)
+            byol_obs_corpus, byol_dones_corpus, byol_priv_corpus = self._prepare_byol_corpus(obs_raw, dones_raw)    # append off-policy data
+            self._append_byol_replay(obs_raw, dones_raw)
+
+            # Ramp up BYOL loss weight
             if curr_byol_lambda > 0 and self.total_num_iters > 0:
-                warmup_iters = max(1, int(self.total_num_iters * 0.1))
+                warmup_iters = max(1, int(self.total_num_iters * 0.2))  
                 ramp = min(1.0, self.cnts / float(warmup_iters))
                 curr_byol_lambda = float(curr_byol_lambda * 0.5 * (1.0 - np.cos(np.pi * ramp)))
 
@@ -297,8 +369,6 @@ class PPOWithBYOL(PPO):
         groups = list(set(self.policy.obs_groups["policy"] + self.policy.obs_groups["critic"]))
         obs_flat = extract_flat_obs_dict(self.storage, groups) # {group: [T*N, D_g]}
 
-        # b_obs = self.storage.observations.flatten(0, 1) # NOTE: rsl-rl PPO agent uses 'obs' key.
-        # keep vectorized obs structure
         b_logprobs = self.storage.actions_log_prob.flatten(0, 1)
         b_actions = a_all.flatten(0, 1)
         b_values = self.storage.values.flatten(0, 1)
@@ -306,7 +376,7 @@ class PPOWithBYOL(PPO):
         b_advantages = self.storage.advantages.flatten(0, 1)
         b_mu = self.storage.mu.flatten(0, 1)
         b_sigma = self.storage.sigma.flatten(0, 1)
-        b_ctx = self.ctx_buf.reshape((-1, self.byol_z_dim)) if self.enable_byol else None # recontextualization(reconstruction)
+        b_ctx = self.ctx_buf.reshape((-1, self.byol_z_dim)) if self.enable_byol else None 
 
         # Get raw data from storage
         batch_size = self.storage.num_envs * self.storage.num_transitions_per_env
@@ -315,32 +385,35 @@ class PPOWithBYOL(PPO):
         clipfracs = []
 
         byol_mismatch = getattr(self, "_last_logged_mismatch", None)
-        if byol_mismatch is None and self.enable_byol:
+        if byol_mismatch is None and self.enable_byol and byol_obs_corpus is not None and byol_dones_corpus is not None:
             diag_B = min(128, batch_size)
-            v1_d, v2_d, _, _ = sample_byol_windows_phy(
-                obs=obs_raw, dones=dones_raw, W=self.byol_window, B=diag_B,
+            diag_sample = sample_byol_windows_phy(
+                obs=byol_obs_corpus, dones=byol_dones_corpus, W=self.byol_window, B=diag_B,
                 delay=self.byol_delay,
                 gaussian_jitter_std=self.byol_gaussian_jitter_std,
                 frame_drop=self.byol_frame_drop,
                 device=self.device,
-                priv=self._priv_info_buffer,
+                priv=byol_priv_corpus if byol_priv_corpus is not None else self._priv_info_buffer,
             )
-            with torch.no_grad():
-                byol_mismatch = float(self.byol.mismatch_per_window(v1_d, v2_d).mean().item())
-            self._last_logged_mismatch = byol_mismatch
+            v1_d, v2_d = diag_sample[:2]
+            if v1_d.numel() > 0 and v2_d.numel() > 0:
+                with torch.no_grad():
+                    byol_mismatch = float(self.byol.mismatch_per_window(v1_d, v2_d).mean().item())
+                self._last_logged_mismatch = byol_mismatch
 
 
         for _ in range(self.num_learning_epochs):
             cached_v1_v2 = None
-            if self.enable_byol and (curr_byol_lambda > 0):
+            if self.enable_byol and (curr_byol_lambda > 0) and byol_obs_corpus is not None and byol_dones_corpus is not None:
                 B = self.byol_batch if (self.byol_batch is not None and self.byol_batch > 0) else min(512, 2 * mini_batch_size)
                 cached_v1_v2 = sample_byol_windows_phy(
-                    obs=obs_raw, dones=dones_raw, W=self.byol_window, B=B,
+                    obs=byol_obs_corpus, dones=byol_dones_corpus, W=self.byol_window, B=B,
                     delay=self.byol_delay,
                     gaussian_jitter_std=self.byol_gaussian_jitter_std,
                     frame_drop=self.byol_frame_drop,
                     device=self.device,
-                    priv=self._priv_info_buffer,
+                    priv=byol_priv_corpus if byol_priv_corpus is not None else self._priv_info_buffer,
+                    return_weights=True,
                 )
 
             for i in range(self.num_mini_batches):
@@ -350,14 +423,16 @@ class PPOWithBYOL(PPO):
                 original_batch_size = len(mb_inds)
 
                 if self.enable_byol:
-                    self.policy.set_belief(b_ctx[mb_inds])  # recontextualization
+                    self.policy.set_belief(b_ctx[mb_inds]) 
                 mb_obs = {g: v[mb_inds] for g, v in obs_flat.items()}
-                self.policy.act(mb_obs)  # just to set distribution
+
+                # Update the policy distribution for this mini-batch without sampling actions.
+                actor_obs = self.policy.get_actor_obs(mb_obs)
+                actor_obs = self.policy.actor_obs_normalizer(actor_obs)
+                self.policy.update_distribution(actor_obs) 
+
                 newlogprobs = self.policy.get_actions_log_prob(b_actions[mb_inds])
                 newvalue = self.policy.evaluate(mb_obs)
-
-                new_mu = self.policy.action_mean[:original_batch_size]
-                new_sigma = self.policy.action_std[:original_batch_size]
                 new_entropy = self.policy.entropy[:original_batch_size]
 
                 logratio = newlogprobs - torch.squeeze(b_logprobs[mb_inds])
@@ -365,24 +440,20 @@ class PPOWithBYOL(PPO):
 
                 """ adaptive LR and BYOL loss lambda"""
                 with torch.no_grad():
-                    clipfracs.append((torch.abs(ratio - 1.0) > self.clip_param).float().mean().item())
-                    # use approx KL for adaptive LR
-                    kl_approx = (ratio - 1.0 - torch.log(ratio))
-                    kl_mean = kl_approx.mean()
+                    kl_mean = ((ratio - 1) - logratio).mean()
+                    clipfracs += [((ratio - 1.0).abs() > self.clip_param).float().mean().item()]
 
-                    if self.desired_kl is not None:
-                        if self.schedule == "adaptive":
-                            if kl_mean > self.desired_kl * 2.0:
-                                self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                            elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                                self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-                        elif self.schedule == "linear":
-                            self.learning_rate = self._base_policy_lr * (1 - self.cnts / float(self.total_num_iters))
+                    if self.desired_kl is not None and self.schedule == "adaptive":
+                        if kl_mean > self.desired_kl * 2.0:
+                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
-                        # update optimizer learning rates (only for policy groups)
+                        scale = self.learning_rate / self._base_policy_lr
                         for pg, base in zip(self.optimizer.param_groups, self._base_group_lrs):
-                            if pg.get("tag", "policy") == "policy":
-                                pg["lr"] = self.learning_rate
+                            tag = pg.get("tag", "policy")
+                            if tag == "policy":
+                                pg["lr"] = base * scale
                 
                 mb_adv = b_advantages[mb_inds]
                 if self.normalize_advantage_per_mini_batch:
@@ -406,30 +477,46 @@ class PPOWithBYOL(PPO):
 
                 # BYOL loss
                 byol_loss = torch.tensor(0.0, device=self.device)
+                domain_loss = torch.tensor(0.0, device=self.device)
                 if self.enable_byol and (curr_byol_lambda > 0) and cached_v1_v2 is not None:
-                    v1, v2, _, _ = cached_v1_v2
-                    loss_vec = self.byol.loss_per_sample(v1, v2) 
-                    weights = torch.ones_like(loss_vec)
+                    v1, v2 = cached_v1_v2[:2]
+                    weights = cached_v1_v2[4] if len(cached_v1_v2) >= 5 else None
+                    loss_vec = self.byol.loss_per_sample(v1, v2)
+                    if weights is not None:
+                        loss_vec = loss_vec * weights.view(-1)
                     if self.byol_update_proportion < 1.0:
                         B = loss_vec.shape[0]
                         mask_ = torch.randperm(B, device=self.device) < int(B * self.byol_update_proportion)
                         denom = torch.clamp(mask_.sum(), min=1.0)
-                        byol_loss = ((loss_vec * weights) * mask_.float()).sum() / denom
+                        byol_loss = (loss_vec * mask_.float()).sum() / denom
                     else:
                         byol_loss = loss_vec.mean()
+                
+                    # Experimental: domain prediction loss with gradient reversal
+                    if self._experimental and "terrain_level" in self._priv_info_buffer.buffers:
+                        y = self._priv_info_buffer.get("terrain_level").flatten(0, 1)[mb_inds].squeeze(-1).float()  # [B]
+                        z_ctx = b_ctx[mb_inds].detach()  # stop gradient to BYOL context
+                        y_pred = self._domain_predictor(grad_reverse(z_ctx, 1.0))
+                        domain_loss = nn.functional.mse_loss(y_pred.squeeze(-1), y)
+                        print(f"[DEBUG] Domain loss: {domain_loss.item():.6f}")
+                        byol_loss = byol_loss + 0.1 * domain_loss 
 
-                loss = pg_loss + self.value_loss_coef * v_loss - self.entropy_coef * entropy_loss + curr_byol_lambda * byol_loss
+
+                loss = (
+                    pg_loss
+                    + self.value_loss_coef * v_loss
+                    - self.entropy_coef * entropy_loss
+                    + curr_byol_lambda * byol_loss
+                )
 
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.param_to_clip, self.max_grad_norm)
                 self.optimizer.step()
 
-                # Update targets with EMA. TODO: every update, epoch, or mini-batch?
                 if self.enable_byol and (curr_byol_lambda > 0):
                     self.byol.ema_update()
 
-        # log
         loss_dict = {
             "value_function": v_loss.item(),
             "surrogate": pg_loss.item(),
@@ -438,13 +525,15 @@ class PPOWithBYOL(PPO):
             "clipfrac": float(np.mean(clipfracs) if clipfracs else 0.0),
         }
         if self.enable_byol:
-            loss_dict["byol"] = float(byol_loss.item())
+            loss_dict["byol_loss"] = float(byol_loss.item())
             loss_dict["byol_tau"] = float(self.byol.tau)
             loss_dict["byol_lambda"] = float(curr_byol_lambda)
             if byol_mismatch is not None:
                 loss_dict["byol_mismatch"] = float(byol_mismatch)
-            if self.byol_intrinsic_coef > 0.0:
-                loss_dict["byol_intrinsic"] = float(self._last_intrinsic_bonus)
+            if self._experimental and "terrain_level" in self._priv_info_buffer.buffers:
+                loss_dict["domain_loss"] = float(domain_loss.item())
+            self._last_logged_mismatch = None
+            self.byol.eval()
 
         self.storage.clear()
         self.cnts += 1
@@ -452,74 +541,6 @@ class PPOWithBYOL(PPO):
             self._priv_info_buffer.zero_()
 
         return loss_dict
-
-    @torch.no_grad()
-    def _apply_intrinsic_rewards(self, obs_raw: torch.Tensor, dones_raw: torch.Tensor) -> float:
-        if (not self.enable_byol) or (self.byol is None) or (self.byol_intrinsic_coef <= 0.0):
-            self._last_logged_mismatch = None
-            return 0.0
-
-        total_frames = obs_raw.shape[0] * obs_raw.shape[1]
-        if total_frames == 0:
-            self._last_logged_mismatch = None
-            return 0.0
-
-        B = min(256, max(1, total_frames // max(1, self.byol_window // 2)))
-        v1, v2, picks, _ = sample_byol_windows_phy(
-            obs=obs_raw,
-            dones=dones_raw,
-            W=self.byol_window,
-            B=B,
-            delay=self.byol_delay,
-            gaussian_jitter_std=self.byol_gaussian_jitter_std,
-            frame_drop=self.byol_frame_drop,
-            device=self.device,
-            priv=self._priv_info_buffer,
-        )
-        if v1.numel() == 0:
-            self._last_logged_mismatch = None
-            return 0.0
-        mismatch = self.byol.mismatch_per_window(v1, v2)
-        if mismatch.numel() == 0:
-            self._last_logged_mismatch = None
-            return 0.0
-        self._last_logged_mismatch = float(mismatch.mean().item())
-        return self._inject_intrinsic_reward(mismatch, picks, v1.shape[1])
-
-    @torch.no_grad()
-    def _inject_intrinsic_reward(
-        self,
-        mismatch: torch.Tensor,
-        picks: list[tuple[int, int]],
-        window_size: int,
-    ) -> float:
-        if mismatch is None or mismatch.numel() == 0 or not picks:
-            return 0.0
-        rewards = getattr(self.storage, "rewards", None)
-        if rewards is None:
-            return 0.0
-        if rewards.ndim == 3 and rewards.shape[-1] == 1:
-            rew_view = rewards[..., 0]
-        else:
-            rew_view = rewards
-        if rew_view.numel() == 0:
-            return 0.0
-
-        T, N = rew_view.shape[0], rew_view.shape[1]
-        if T == 0 or N == 0:
-            return 0.0
-        count = min(len(picks), mismatch.shape[0])
-        if count == 0:
-            return 0.0
-
-        device = rew_view.device
-        idx_tensor = torch.tensor(picks[:count], dtype=torch.long, device=device)
-        starts = idx_tensor[:, 0].clamp_(0, max(0, T - 1))
-        envs = idx_tensor[:, 1].clamp_(0, max(0, N - 1))
-        scale = -self.byol_intrinsic_coef / float(max(1, window_size))
-        bonus = mismatch[:count].to(device=device, dtype=rew_view.dtype) * scale
-        rew_view.index_put_((starts, envs), bonus, accumulate=True)
-        return float(bonus.mean().item())
 
     def _resolve_priv_info_group(self) -> PrivInfoGroup | None:
         cfg = self._priv_info_cfg

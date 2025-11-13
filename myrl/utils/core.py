@@ -12,6 +12,19 @@ def layer_init(layer: nn.Linear, std: float = math.sqrt(2.0), bias_const: float 
     nn.init.constant_(layer.bias, bias_const)
     return layer
 
+class _GradReverseFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = float(lambd)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambd * grad_output, None
+
+def grad_reverse(x: torch.Tensor, lambd: float = 1.0) -> torch.Tensor:
+    return _GradReverseFn.apply(x, lambd)
+
 def mlp(in_dim: int, out_dim: int) -> nn.Sequential:
     return nn.Sequential(
         nn.Linear(in_dim, 256),
@@ -51,102 +64,44 @@ class SeqEncoder(nn.Module):
         self.obs_encoder = obs_encoder
         self.gru = nn.GRU(input_size=self.obs_encoder.out_dim,
                           hidden_size=z_dim,
-                          batch_first=True)
+                          batch_first=True,
+                          bidirectional=False) # experimental: bidirectional GRU
         for name, param in self.gru.named_parameters():
             if 'weight' in name:
                 nn.init.orthogonal_(param)
             elif 'bias' in name:
-                nn.init.constant_(param, 1.0)
+                nn.init.constant_(param, 0.0)
                 
-        if output_type not in ("last", "mean", "attn"):
+        if output_type not in ("last", "mean"):
             raise ValueError(f"Unsupported output_type for SeqEncoder: {output_type}")
         self.output_type = str(output_type)
-        if self.output_type == "attn":
-            self.attn = layer_init(nn.Linear(z_dim, 1), std=0.1)
 
     def _encode_frames(self, obs_seq: torch.Tensor) -> torch.Tensor:
         B, W, D = obs_seq.shape
         feats = self.obs_encoder(obs_seq.reshape(B * W, D)).reshape(B, W, -1)  # [B,W,F]
         return feats
 
-    def forward(self, obs_seq: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
+    def forward(self, obs_seq: torch.Tensor) -> torch.Tensor:
         feats = self._encode_frames(obs_seq)        # [B,W,F]
         out, hT = self.gru(feats)                   # out: [B,W,z], hT: [1,B,z]
         
         if self.output_type == "last":
             return hT.squeeze(0)    # [B,z]
         elif self.output_type == "mean":
-            return out.mean(dim=1)   # [B,z] 
-        elif self.output_type == "attn":
-            attn_weights = torch.softmax(self.attn(out).squeeze(-1), dim=-1)     # [B,W]
-            z = (out * attn_weights.unsqueeze(-1)).sum(dim=1)                    # [B,z]
-            return z
-        else:
-            raise ValueError(f"Unknown output_type: {self.output_type}")
-        
-class TransformerEncoder(nn.Module):
-    """ Transformer encoder for sequential data. """
-    def __init__(self,
-                 obs_encoder: ObsEncoder,
-                 z_dim: int,
-                 output_type: str = "last",
-                 n_layers: int = 2,
-                 n_heads: int = 4,
-                 dim_feedforward: int = 256,
-                 dropout: float = 0.1):
-        super().__init__()
-        self.obs_encoder = obs_encoder
-        if output_type not in ("last", "mean"):
-            raise ValueError(f"Unsupported output_type for TransformerEncoder: {output_type}")
-        self.output_type = str(output_type)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=z_dim,
-                                                   nhead=n_heads,
-                                                   dim_feedforward=dim_feedforward,
-                                                   dropout=dropout,
-                                                   activation='relu',
-                                                   batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.input_proj = nn.Linear(self.obs_encoder.out_dim, z_dim)
-
-    def _encode_frames(self, obs_seq: torch.Tensor) -> torch.Tensor:
-        B, W, D = obs_seq.shape # batch, window, obs_dim
-        feats = self.obs_encoder(obs_seq.reshape(B * W, D)).reshape(B, W, -1)  # [B,W,F]
-        return feats
-    
-    def forward(self, obs_seq: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
-        feats = self._encode_frames(obs_seq)       # [B,W,F]: batch, window, feat_dim
-        x = self.input_proj(feats)                 # [B,W,z_dim]
-        
-        if is_causal:
-            W = x.size(1)
-            mask = torch.triu(torch.ones((W, W), device=x.device), diagonal=1).bool()
-        else:
-            mask = None
-        
-        out = self.transformer_encoder(x, mask=mask)  # [B,W,z_dim]
-        if self.output_type == "last":
-            return out[:, -1, :]    # [B,z_dim]
-        elif self.output_type == "mean":
-            return out.mean(dim=1)   # [B,z_dim]
+            return out.mean(dim=1)   # [B,z]
         else:
             raise ValueError(f"Unknown output_type: {self.output_type}")
         
 class BYOLSeq(nn.Module):
-    """
-    BYOL for sequential data (BYOL-Seq).
-    """
+    """BYOL for sequential data (BYOL-Seq)."""
     def __init__(self,
                  obs_encoder: ObsEncoder,
                  z_dim: int = 128,
                  proj_dim: int = 128,
                  tau: float = 0.996,
-                 output_type: str = "mean",
-                 use_transformer: bool = False):
+                 output_type: str = "mean"):
         super().__init__()
-        if use_transformer:
-            self.f_online = TransformerEncoder(obs_encoder, z_dim=z_dim, output_type=output_type)
-        else:
-            self.f_online = SeqEncoder(obs_encoder, z_dim=z_dim, output_type=output_type)
+        self.f_online = SeqEncoder(obs_encoder, z_dim=z_dim, output_type=output_type)
         self.g_online = mlp(z_dim, proj_dim)
         self.q_online = mlp(proj_dim, proj_dim)
 
@@ -165,8 +120,7 @@ class BYOLSeq(nn.Module):
         return self
 
     def infer_ctx(self, obs_seq: torch.Tensor) -> torch.Tensor:
-        """Infer context vector from observation sequence. obs_seq: [B,W,D_obs] -> [B,z_dim]"""
-        return self.f_online(obs_seq)
+        return self.f_online(obs_seq)  # [B,W,D_obs] -> [B,z_dim]
     
     @torch.no_grad()
     def ema_update(self) -> None:
@@ -209,13 +163,12 @@ class BYOLSeq(nn.Module):
         return 0.5 * (m12 + m21)
 
     def online_parameters(self, include_obs_encoder: bool):
-        params = (
-            list(self.f_online.gru.parameters())
-            + list(self.g_online.parameters())
-            + list(self.q_online.parameters())
-        )
-        if include_obs_encoder:
-            params = list(self.f_online.obs_encoder.parameters()) + params
+        seq_params: List[torch.Tensor] = []
+        for name, param in self.f_online.named_parameters():
+            if (not include_obs_encoder) and name.startswith("obs_encoder"):
+                continue
+            seq_params.append(param)
+        params = seq_params + list(self.g_online.parameters()) + list(self.q_online.parameters())
         return params
 
 @torch.no_grad()
@@ -284,7 +237,7 @@ def extract_policy_obs_and_dones(storage) -> Tuple[torch.Tensor, torch.Tensor]:
     return obs, dones
 
 def extract_flat_obs_dict(storage, group_names: Iterable[str]) -> Dict[str, torch.Tensor]:
-    """Return {group: [T*N, D_g]} robustly, from storage.observations/obs."""
+    """Return {group: [T*N, D_g]} from storage.observations/obs."""
     obs_container = getattr(storage, "observations", None)
     if obs_container is None:
         obs_container = getattr(storage, "obs", None)
@@ -351,24 +304,38 @@ UNITREE_GO2_ROUGH_OBS_GROUP = ObsGroup(
 @dataclass
 class PrivInfoGroup:
     terrain_level: Optional[str] = "Curriculum/terrain_levels"
-    vel_error_xy: Optional[str] = "Metrics/base_velocity/error_vel_xy"
-    vel_error_yaw: Optional[str] = "Metrics/base_velocity/error_vel_yaw"
+    vel_error_xy: Optional[str] = "privileged/vel_error_xy"
+    vel_error_yaw: Optional[str] = "privileged/vel_error_yaw"
     time_out: Optional[str] = "Episode_Termination/time_out"
     base_contact: Optional[str] = "Episode_Termination/base_contact"
+
+    # privileged metrics
+    contact_slip: Optional[str] = "privileged/contact_slip"
+    torque_rms: Optional[str] = "privileged/torque_rms"
+    terrain_roughness: Optional[str] = "privileged/terrain_roughness"
 
 def _extract_extra_value(extras: Dict, key: str):
     """Fetch value from extras using either flat or hierarchical keys."""
     if not isinstance(extras, dict):
         return None
-    if key in extras:
-        return extras[key]
-    node = extras
-    for token in key.split("/"):
-        if isinstance(node, dict) and token in node:
-            node = node[token]
-        else:
-            return None
-    return node
+
+    def _probe(container: Dict):
+        if key in container:
+            return container[key]
+        node = container
+        for token in key.split("/"):
+            if isinstance(node, dict) and token in node:
+                node = node[token]
+            else:
+                return None
+        return node
+
+    for candidate in (extras, extras.get("log")):
+        if isinstance(candidate, dict):
+            value = _probe(candidate)
+            if value is not None:
+                return value
+    return None
 
 def _value_to_tensor(value, num_envs: int, device: torch.device) -> Optional[torch.Tensor]:
     """Normalize scalars from extras into [N,1] tensors on the desired device."""
@@ -381,8 +348,11 @@ def _value_to_tensor(value, num_envs: int, device: torch.device) -> Optional[tor
     if data.dim() == 0:
         data = data.expand(num_envs)
     if data.shape[0] != num_envs:
-        data = data.reshape(num_envs, -1)
-        data = data[:, 0]
+        if data.numel() == 1:
+            data = data.reshape(1).expand(num_envs)
+        else:
+            data = data.reshape(num_envs, -1)
+            data = data[:, 0]
     return data.view(num_envs, 1)
 
 
@@ -532,7 +502,7 @@ def _feature_jitter(x: torch.Tensor, noise_std: float, feat_drop: float, rng: to
         x.mul_(1.0 - drop.float())
 
 def _frame_drop_inplace(x: torch.Tensor, p: float, rng: torch.Generator) -> None:
-    """In-place 'temporal dropout': with prob p, copy previous frame at t."""
+    """Sticky frames: with probability p, replace frame t with frame t-1."""
     if p <= 0: return
     B, T, _ = x.shape
     mask = _rand_gen((B, T), x.device, rng) < p
@@ -554,6 +524,14 @@ def _time_mask_inplace(x: torch.Tensor, span: int, prob: float, rng: torch.Gener
     for b in torch.nonzero(apply, as_tuple=False).flatten():
         s = int(starts[b].item())
         x[b, s:s+span, :] = 0
+
+def _actuator_lag_inplace(x: torch.Tensor, obs_group: ObsGroup, lag_prob: float, rng: torch.Generator):
+    """Apply temporal dropout ONLY to the prev_actions slice to mimic actuator lag."""
+    if lag_prob <= 0 or obs_group.prev_actions is None:
+        return
+    v = _as_view(x, obs_group.prev_actions)  # [B,W,D_a]
+    if v is not None:
+        _frame_drop_inplace(v, lag_prob, rng)
 
 @torch.no_grad()
 def _valid_window_starts(dones: torch.Tensor, W: int) -> np.ndarray:
@@ -595,16 +573,26 @@ def sample_byol_windows_phy(
     imu_drift_lin_std: float = 0.02,
     imu_drift_ang_std: float = 0.02,
     slip_lin_scale_range: Tuple[float,float] = (0.7, 1.0),
-    joint_gain_std: float = 0.01,
-    joint_deadzone: float = 0.0,
     joint_pos_step: float = 0.0,
     sensor_spike_prob: float = 0.05,
     sensor_spike_mag: float = 0.05,
     device: torch.device = torch.device("cpu"),
     priv: Optional["PrivInfoBuffer"] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[int,int]], int]:
+    return_weights: bool = False,
+
+    slip_norm: float = 0.5,            # m/s
+    torque_norm: float = 40.0,         # N·m RMS
+    rough_norm: float = 0.05,          # meters RMS height
+) -> Union[
+    Tuple[torch.Tensor, torch.Tensor, List[Tuple[int,int]], int],
+    Tuple[torch.Tensor, torch.Tensor, List[Tuple[int,int]], int, torch.Tensor],
+]:
     """
     Sample B window pairs (v1, v2) with independent augs.
+
+    When `return_weights` is True, also return per-window weights derived from the
+    privileged `vel_error_xy` and `vel_error_yaw` buffers (defaults to uniform
+    weights when the signals are missing).
     """
     W_use = min(int(W), int(obs.shape[0]))
     starts = _valid_window_starts(dones, W_use)
@@ -632,7 +620,7 @@ def sample_byol_windows_phy(
     g1 = torch.Generator(device=device).manual_seed(torch.randint(0, 2**31 - 1, (1,)).item())
     g2 = torch.Generator(device=device).manual_seed(torch.randint(0, 2**31 - 1, (1,)).item())
 
-    # general augmentations
+    # Gaussian feature jitter + temporal dropout + sticky frames
     if gaussian_jitter_std > 0:
         _feature_jitter(v1o, gaussian_jitter_std, 0.0, g1)
         _feature_jitter(v2o, gaussian_jitter_std, 0.0, g2)
@@ -654,136 +642,98 @@ def sample_byol_windows_phy(
     priv_v1 = _gather_priv_windows(starts_v1)
     priv_v2 = _gather_priv_windows(starts_v2)
 
+    weights: Optional[torch.Tensor] = None
+    if return_weights:
+        size = len(picks)
+        if size == 0:
+            weights = torch.empty(0, device=device)
+        else:
+            vel_err = priv_v1.get("vel_error_xy")
+            yaw_err = priv_v1.get("vel_error_yaw")
+            if vel_err is None and yaw_err is None:
+                weights = torch.ones(size, device=device)
+            else:
+                comps = []
+                if vel_err is not None:
+                    comps.append(vel_err.mean(dim=(1, 2)))
+                if yaw_err is not None:
+                    comps.append(yaw_err.mean(dim=(1, 2)))
+                score = torch.stack(comps, dim=0).sum(dim=0)
+                score = torch.clamp(score, min=1e-6)
+                weights = score / score.mean().clamp(min=1e-6)
+
     def _apply_physics(vx: torch.Tensor, rng: torch.Generator, priv_windows: Dict[str, torch.Tensor]) -> None:
         if obs_group is None:
             return
         B, W, _ = vx.shape
         dev = vx.device
 
-        def _priv_strength(name: str) -> Optional[torch.Tensor]:
+        def _strength(name: str, norm: float) -> Optional[torch.Tensor]:
             buf = priv_windows.get(name)
             if buf is None:
                 return None
-            return torch.tanh(buf.mean(dim=1)).to(device=dev, dtype=vx.dtype)
+            val = buf.mean(dim=1)
+            return torch.tanh(val / max(1e-6, norm)).clamp(0, 1).to(device=dev, dtype=vx.dtype)
 
-        terrain = _priv_strength("terrain_level")
-        vel_xy = _priv_strength("vel_error_xy")
-        vel_yaw = _priv_strength("vel_error_yaw")
-        timeout = _priv_strength("time_out")
-        base_contact = _priv_strength("base_contact")
+        s_slip  = _strength("contact_slip",    slip_norm)
+        s_torque= _strength("torque_rms",      torque_norm)
+        s_rough = _strength("terrain_roughness", rough_norm)
 
-        # yaw perturbation follows yaw tracking error / terrain difficulty
-        if yaw_rot_max > 0:
-            yaw_scale = torch.full((B, 1), yaw_rot_max, device=dev, dtype=vx.dtype)
-            if vel_yaw is not None:
-                yaw_scale *= (0.4 + 0.6 * vel_yaw.abs().clamp_max(1.0))
-            elif terrain is not None:
-                yaw_scale *= (0.6 + 0.4 * terrain.abs().clamp_max(1.0))
-            yaw_noise = (_rand_gen((B, 1), dev, rng) * 2.0 - 1.0) * yaw_scale  # [B,1]
-            yaw = yaw_noise.expand(-1, W)
-            _apply_yaw_rot_inplace(vx, obs_group, yaw)
+        # 1) Friction: slip scaling + mild yaw noise from slip
+        if s_slip is not None:
+            slip_min, slip_max = slip_lin_scale_range
+            base = slip_max - (slip_max - slip_min) * s_slip     # more slip -> more shrink
+            _sim_slip_inplace(vx, obs_group, base.expand(-1, W))
+            # yaw jitter from slip (cap at yaw_rot_max)
+            yaw_scale = yaw_rot_max * (0.2 + 0.8 * s_slip)       # [B,1]
+            yaw = (_rand_gen((B, 1), dev, rng) * 2 - 1) * yaw_scale
+            _apply_yaw_rot_inplace(vx, obs_group, yaw.expand(-1, W))
 
-        # slope-aware gravity tilt informed by terrain difficulty & impacts
-        g_slice = _as_view(vx, obs_group.proj_gravity) if obs_group.proj_gravity is not None else None
-        if g_slice is not None and g_slice.shape[-1] >= 2:
-            tilt_ctrl = torch.zeros((B, 1), device=dev, dtype=vx.dtype)
-            if terrain is not None:
-                tilt_ctrl += terrain.relu().clamp_max(1.0)
-            if base_contact is not None:
-                tilt_ctrl += base_contact.relu().clamp_max(1.0)
-            tilt_ctrl = torch.clamp(tilt_ctrl, 0.0, 1.0)
-            if torch.any(tilt_ctrl > 0):
-                tilt_scale = (0.01 + 0.04 * tilt_ctrl).unsqueeze(1)  # [B,1,1]
-                tilt_noise = _randn_like(vx.new_zeros(B, W, 2), rng) * tilt_scale
-                g_slice[..., :2] += tilt_noise
+        # 2) Geometry: gravity tilt noise & small yaw from roughness
+        if s_rough is not None:
+            g_slice = _as_view(vx, obs_group.proj_gravity)
+            if g_slice is not None and g_slice.shape[-1] >= 2:
+                tilt_scale = (0.005 + 0.03 * s_rough).unsqueeze(1)      # [B,1,1]
+                g_slice[..., :2] += _randn_like(vx.new_zeros(B, W, 2), rng) * tilt_scale
+            yaw_scale = yaw_rot_max * (0.1 + 0.6 * s_rough)
+            yaw = (_rand_gen((B, 1), dev, rng) * 2 - 1) * yaw_scale
+            _apply_yaw_rot_inplace(vx, obs_group, yaw.expand(-1, W))
 
-        # slip scaling informed by XY velocity tracking error / rough terrain
-        slip_min, slip_max = slip_lin_scale_range
-        slip_range = max(0.0, slip_max - slip_min)
-        if slip_range > 0:
-            slip_base = slip_min + slip_range * _rand_gen((B, 1), dev, rng)
-            slip_ctrl = torch.zeros_like(slip_base, dtype=vx.dtype)
-            if vel_xy is not None:
-                slip_ctrl += vel_xy.abs().clamp_max(1.0)
-            if terrain is not None:
-                slip_ctrl += terrain.relu().clamp_max(1.0)
-            slip_ctrl = torch.clamp(slip_ctrl, 0.0, 1.0)
-            slip_scale = slip_base - (slip_base - slip_min) * slip_ctrl
-            _sim_slip_inplace(vx, obs_group, slip_scale.expand(-1, W))
-
-        # IMU drift driven by tracking errors / impending timeouts
+        # 3) IMU drift grows with slip & roughness (tracking gets worse)
         if imu_drift_lin_std > 0 or imu_drift_ang_std > 0:
-            ctrl_lin = torch.ones((B, 1), device=dev, dtype=vx.dtype)
-            ctrl_ang = torch.ones((B, 1), device=dev, dtype=vx.dtype)
-            if vel_xy is not None:
-                ctrl_lin += 0.5 * vel_xy.abs().clamp_max(1.0)
-            if vel_yaw is not None:
-                ctrl_ang += 0.5 * vel_yaw.abs().clamp_max(1.0)
-            if timeout is not None:
-                ctrl_lin += 0.25 * timeout.relu().clamp_max(1.0)
-                ctrl_ang += 0.25 * timeout.relu().clamp_max(1.0)
-            bias_lin = _randn_like(vx.new_zeros(B, 1, 3), rng) * imu_drift_lin_std
-            bias_ang = _randn_like(vx.new_zeros(B, 1, 3), rng) * imu_drift_ang_std
-            bias_lin *= ctrl_lin.unsqueeze(-1)
-            bias_ang *= ctrl_ang.unsqueeze(-1)
+            ctrl = ( (s_slip if s_slip is not None else 0.0)
+                   + (s_rough if s_rough is not None else 0.0) )
+            ctrl = torch.clamp(ctrl, 0, 1)
+            bias_lin = _randn_like(vx.new_zeros(B, 1, 3), rng) * (imu_drift_lin_std * (0.5 + 0.5 * ctrl)).unsqueeze(-1)
+            bias_ang = _randn_like(vx.new_zeros(B, 1, 3), rng) * (imu_drift_ang_std * (0.5 + 0.5 * ctrl)).unsqueeze(-1)
             _sim_imu_drift_inplace(vx, obs_group, bias_lin, bias_ang)
-
-        # More calibration noise once robot stability degrades
-        if joint_gain_std > 0:
-            gain_scale = 1.0
-            if base_contact is not None:
-                gain_scale += 0.5 * float(base_contact.abs().mean().item())
-            if timeout is not None:
-                gain_scale += 0.25 * float(timeout.relu().mean().item())
-            _per_leg_calibration_inplace(vx, obs_group, joint_gain_std * gain_scale, rng)
-
-        if joint_deadzone > 0 or joint_pos_step > 0:
-            _sim_deadzone_inplace(vx, obs_group, joint_deadzone, joint_pos_step)
-
-        # command dropout under poor tracking / timeouts
-        cmd_slice = _as_view(vx, obs_group.cmd_vel) if obs_group.cmd_vel is not None else None
-        if cmd_slice is not None:
-            drop_ctrl = torch.zeros((B, 1), device=dev, dtype=vx.dtype)
-            if timeout is not None:
-                drop_ctrl += timeout.relu().clamp_max(1.0)
-            if vel_xy is not None:
-                drop_ctrl += vel_xy.abs().clamp_max(1.0)
-            drop_prob = torch.clamp(0.05 + 0.25 * drop_ctrl, 0.0, 0.6)
-            if torch.any(drop_prob > 0):
-                drop_mask = (_rand_gen((B, W), dev, rng) < drop_prob).unsqueeze(-1)
-                cmd_slice.mul_(1.0 - drop_mask.to(dtype=cmd_slice.dtype))
-
-        # actuator stiction when impacts accumulate
-        stiction_ctrl = torch.zeros((B, 1), device=dev, dtype=vx.dtype)
-        if base_contact is not None:
-            stiction_ctrl += base_contact.relu().clamp_max(1.0)
-        if vel_xy is not None:
-            stiction_ctrl += 0.5 * vel_xy.abs().clamp_max(1.0)
-        stiction_scale = torch.clamp(1.0 - 0.4 * torch.clamp(stiction_ctrl, 0.0, 1.0), 0.2, 1.0)
-        if torch.any(stiction_scale < 1.0):
+        
+        # 4) Actuation: stiction + lag increases with torque RMS
+        if s_torque is not None:
+            stiction = torch.clamp(1.0 - 0.4 * s_torque, 0.3, 1.0)   # shrink v_joint & prev_actions
             for name in ("joint_vel", "prev_actions"):
-                idx = getattr(obs_group, name)
-                v = _as_view(vx, idx)
-                if v is None:
-                    continue
-                scale = stiction_scale
-                while scale.dim() < v.dim():
-                    scale = scale.unsqueeze(-1)
-                v.mul_(scale)
-
-        if sensor_spike_prob > 0 and sensor_spike_mag > 0:
-            spike_prob = sensor_spike_prob
-            spike_mag = sensor_spike_mag
-            if base_contact is not None:
-                spike_prob *= float((1.0 + base_contact.abs().mean()).clamp(max=2.0).item())
-            if timeout is not None:
-                spike_prob *= float((1.0 + timeout.relu().mean()).clamp(max=2.0).item())
-            if vel_xy is not None:
-                spike_mag *= float((1.0 + vel_xy.abs().mean()).clamp(max=2.0).item())
-            spike_prob = min(spike_prob, 1.0)
-            _sim_sensor_spike_inplace(vx, obs_group, spike_prob, spike_mag, rng)
+                v = _as_view(vx, getattr(obs_group, name))
+                if v is not None:
+                    scale = stiction
+                    while scale.dim() < v.dim():
+                        scale = scale.unsqueeze(-1)
+                    v.mul_(scale)
+            # actuator lag as temporal dropout on prev_actions only
+            _actuator_lag_inplace(vx, obs_group, lag_prob=0.05 + 0.25 * s_torque.mean(), rng=rng)
+            # small quantization/deadzone
+            _sim_deadzone_inplace(vx, obs_group, deadzone=0.0 + 0.02 * s_torque.mean().item(),
+                                  step=joint_pos_step)
+        
+        # 5) Rare spikes stronger when slip is high (impacts/micro-bounces)
+        slip_mean = float(s_slip.mean().item()) if s_slip is not None else 0.0
+        slip_scale = min(2.0, 1.0 + slip_mean)
+        spike_prob = sensor_spike_prob * slip_scale
+        spike_mag  = sensor_spike_mag  * slip_scale
+        _sim_sensor_spike_inplace(vx, obs_group, min(spike_prob, 1.0), spike_mag, rng)
 
     _apply_physics(v1o, g1, priv_v1)
     _apply_physics(v2o, g2, priv_v2)
 
+    if return_weights:
+        return v1o, v2o, picks, len(picks), weights
     return v1o, v2o, picks, len(picks)

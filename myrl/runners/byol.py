@@ -7,6 +7,7 @@ import time
 import torch
 import warnings
 from collections import deque
+from collections.abc import Mapping
 
 import rsl_rl
 from rsl_rl.algorithms import PPO
@@ -602,6 +603,87 @@ class OnPolicyRunnerBYOL(OnPolicyRunner):
 
         # Delegate to base logger
         return super().log(locs, width, pad)
+
+    def dump_storage(self, output_path: str | None = None, include_priv_info: bool = True) -> str:
+        """Dump PPOWithBYOL rollout storage (and BYOL buffers) for offline analysis."""
+        alg = self.alg
+        if not isinstance(alg, PPOWithBYOL):
+            raise RuntimeError("dump_storage is only supported when the runner uses PPOWithBYOL.")
+        storage = getattr(alg, "storage", None)
+        if storage is None:
+            raise RuntimeError("PPOWithBYOL storage has not been initialized yet.")
+
+        if output_path is None:
+            if self.log_dir is None:
+                raise ValueError("output_path must be provided when no log_dir is configured.")
+            dump_root = os.path.join(self.log_dir, "diagnostics")
+            os.makedirs(dump_root, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            output_path = os.path.join(
+                dump_root, f"ppo_byol_storage_it{self.current_learning_iteration}_{stamp}.pt"
+            )
+        else:
+            dump_root = os.path.dirname(output_path)
+            if dump_root:
+                os.makedirs(dump_root, exist_ok=True)
+
+        def _clone(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().clone()
+            if isinstance(value, Mapping):
+                return {k: _clone(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_clone(v) for v in value]
+            if isinstance(value, tuple):
+                return tuple(_clone(v) for v in value)
+            return value
+
+        storage_payload = {}
+        for name in (
+            "observations",
+            "actions",
+            "rewards",
+            "returns",
+            "values",
+            "advantages",
+            "dones",
+            "actions_log_prob",
+            "mu",
+            "sigma",
+            "masks",
+        ):
+            if hasattr(storage, name):
+                storage_payload[name] = _clone(getattr(storage, name))
+
+        metadata = {
+            "iteration": int(self.current_learning_iteration),
+            "step": int(getattr(storage, "step", -1)),
+            "num_envs": int(getattr(storage, "num_envs", -1)),
+            "num_steps_per_env": int(getattr(storage, "num_transitions_per_env", -1)),
+            "device": str(self.device),
+        }
+
+        ctx_buf = _clone(getattr(alg, "ctx_buf", None))
+        obs_window = _clone(getattr(alg, "_obs_win", None))
+        priv_info = None
+        priv_buf = getattr(alg, "_priv_info_buffer", None)
+        if include_priv_info and priv_buf is not None:
+            priv_info = {name: _clone(buf) for name, buf in priv_buf.get_all().items()}
+
+        dump_payload = {
+            "meta": metadata,
+            "storage": storage_payload,
+            "ctx_buf": ctx_buf,
+            "obs_window": obs_window,
+            "byol_enabled": bool(getattr(alg, "enable_byol", False)),
+            "last_intrinsic_bonus": getattr(alg, "_last_intrinsic_bonus", None),
+            "priv_info": priv_info,
+        }
+
+        torch.save(dump_payload, output_path)
+        return output_path
 
     def _configure_multi_gpu(self):
         """ OVERRIDE: Configure multi-gpu training.
