@@ -41,6 +41,7 @@ class PPObyolRunnerCfg(RslRlOnPolicyRunnerCfg):
         byol_proj_dim: int = 128
         byol_update_proportion: float = 0.5
         byol_replay_iters: int = 4
+        rpo_rollout: bool = False
 
         # BYOL augmentations
         byol_delay: int = 2

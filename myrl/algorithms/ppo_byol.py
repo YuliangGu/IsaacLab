@@ -498,7 +498,7 @@ class PPOWithBYOL(PPO):
                         z_ctx = b_ctx[mb_inds].detach()  # stop gradient to BYOL context
                         y_pred = self._domain_predictor(grad_reverse(z_ctx, 1.0))
                         domain_loss = nn.functional.mse_loss(y_pred.squeeze(-1), y)
-                        print(f"[DEBUG] Domain loss: {domain_loss.item():.6f}")
+                        # print(f"[DEBUG] Domain loss: {domain_loss.item():.6f}")
                         byol_loss = byol_loss + 0.1 * domain_loss 
 
 

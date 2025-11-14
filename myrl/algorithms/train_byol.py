@@ -10,6 +10,7 @@
 import argparse
 import sys
 import os
+import ast
 
 from isaaclab.app import AppLauncher
 
@@ -44,6 +45,16 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
+parser.add_argument(
+    "--agent-override",
+    dest="agent_overrides",
+    action="append",
+    default=[],
+    help=(
+        "Key=Value overrides applied to the agent config after BYOL overlay. "
+        "Use dotted paths such as agent.algorithm.byol_lambda=0.25 or agent.policy.lr=5e-4."
+    ),
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -125,6 +136,55 @@ def _overlay(cfg_1, cfg_2):
     d2 = cfg_2.to_dict()
     d1.update(d2)
     return type(cfg_1)(**d1)
+
+def _coerce_value(value: str, reference):
+    """Cast override string to the reference attribute type when possible."""
+    if isinstance(reference, bool):
+        return value.lower() in {"1", "true", "t", "yes", "on"}
+    if isinstance(reference, int) and not isinstance(reference, bool):
+        return int(value)
+    if isinstance(reference, float):
+        return float(value)
+    if reference is None:
+        try:
+            return ast.literal_eval(value)
+        except Exception:
+            return value
+    try:
+        return type(reference)(value)
+    except Exception:
+        try:
+            return ast.literal_eval(value)
+        except Exception:
+            return value
+
+
+def _apply_agent_overrides(agent_cfg, overrides):
+    """Apply dotted-path overrides on the agent config object."""
+    for override in overrides:
+        if "=" not in override:
+            raise ValueError(f"Invalid agent override '{override}'. Expected format key=value.")
+        path, raw_value = override.split("=", 1)
+        path = path.strip()
+        raw_value = raw_value.strip()
+        if not path:
+            raise ValueError(f"Invalid agent override '{override}'. Empty key.")
+        target = agent_cfg
+        parts = path.split(".")
+        if parts and parts[0] == "agent":
+            parts = parts[1:]
+        for part in parts[:-1]:
+            if hasattr(target, part):
+                target = getattr(target, part)
+            else:
+                raise KeyError(f"[Agent Override] Unknown namespace '{part}' while applying '{override}'.")
+        attr = parts[-1]
+        if not hasattr(target, attr):
+            raise KeyError(f"[Agent Override] Attribute '{attr}' not found for override '{override}'.")
+        reference = getattr(target, attr)
+        value = _coerce_value(raw_value, reference)
+        setattr(target, attr, value)
+
 
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
@@ -213,9 +273,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg.algorithm.desired_kl = 0.01 
         agent_cfg.algorithm.normalize_advantage_per_mini_batch = False
 
-        if args_cli.byol_debug:
-            print("[BYOL DEBUG] Effective agent config after BYOL overlay:")
-            print_dict(agent_cfg.to_dict(), nesting=4)
+    if args_cli.agent_overrides:
+        _apply_agent_overrides(agent_cfg, args_cli.agent_overrides)
+
+    if args_cli.byol_debug:
+        print("[BYOL DEBUG] Effective agent config after BYOL overlay and overrides:")
+        print_dict(agent_cfg.to_dict(), nesting=4)
+
 
     if agent_cfg.class_name == "OnPolicyRunnerBYOL":
         agent_cfg.num_steps_per_env = 50
